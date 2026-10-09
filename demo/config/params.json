@@ -1,0 +1,37 @@
+{
+  "_comment": "SDVRPD 能耗与时间窗参数集中配置（AC-8.3：取值可按需修改，支持后续更改）。所有数值为合理假设值，已在 SPEC/PLAN 中标注为假设，无文献定值。",
+  "energy_params": {
+    "_comment_truck": "卡车能耗 E = (alpha + beta*max(0,theta) + gamma*max(0,-theta)) * d * (1 + delta*u/Q)",
+    "alpha": 1.0,
+    "beta": 0.8,
+    "gamma": 0.3,
+    "delta": 0.5,
+    "truck_speed": 12.0,
+    "_comment_drone": "无人机三段能耗：巡航(与水平距离/坡度)、爬升(高度增量)、垂直(起降)。系数无量纲化，最终乘 base_energy_per_km。",
+    "drone_base_energy_per_km": 0.6,
+    "drone_cruise_slope_factor": 0.7,
+    "drone_climb_factor": 1.8,
+    "drone_vertical_factor": 2.5,
+    "drone_load_factor": 0.9,
+    "drone_max_payload_kg": 10.0,
+    "drone_battery_capacity_wh": 150.0,
+    "drone_safety_margin": 0.8,
+    "drone_speed": 10.0
+  },
+  "time_window": {
+    "_comment": "软时间窗惩罚系数 phi_j（按小时）。超时部分计入目标函数惩罚。",
+    "phi_per_hour": 200.0,
+    "default_window_start_min": 0,
+    "default_window_end_min": 300
+  },
+  "cost_params": {
+    "_comment": "卡车固定启用成本 F_k 与基础可变成本（每 km）。未服务惩罚。",
+    "truck_fixed_cost": 500.0,
+    "truck_variable_cost_per_km": 1.2,
+    "unassigned_penalty": 5000.0
+  },
+  "network": {
+    "_comment": "卡车数量默认值；无人机数按 CSV 机型数自动推断（SPEC 待澄清#3）。",
+    "num_trucks": 2
+  }
+}
