@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE, ".."))
@@ -47,7 +48,8 @@ elif tab == "求解":
         st.warning("未找到实例 JSON。请先运行：python data/instance.py --force")
     else:
         sel = st.selectbox("选择实例", insts)
-        tb = st.number_input("时间预算 (s)", min_value=5, max_value=300, value=30, step=5)
+        tb = st.number_input("时间预算 (s)", min_value=5, max_value=300, value=30, step=5,
+                             help="ALNS 路线搜索预算。程序会在接近限时时停止新一轮搜索；AI 接口等待和结果保存属于额外耗时。")
         seed = st.number_input("随机种子", min_value=0, max_value=99999, value=1, step=1)
         if st.button("运行求解"):
             with st.spinner("ALNS 求解中..."):
@@ -68,15 +70,65 @@ elif tab == "求解":
                     use_checkpoint=True,
                 )
                 out = solver.run()
+                # 将本次 UI 求解结果持久化。此前结果只显示在当前页面，切换到
+                # “可视化”后页面只能读旧实验文件，导致空图或不同实例显示相同。
+                run_id = time.strftime("ui_%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+                out.update({
+                    "run_id": run_id,
+                    "instance_id": inst.get("instance_id", os.path.splitext(sel)[0]),
+                    "instance_name": sel,
+                    "time_budget": float(tb),
+                    "seed": int(seed),
+                    "recovery_action": llm_res.get("recovery_action"),
+                    "llm_prompt_hash": llm_res.get("llm_prompt_hash", ""),
+                    "llm_attempts": llm_res.get("attempts_log", []),
+                    "llm_static_check": llm_res.get("static_check", {}),
+                })
+                results_dir = os.path.join(PROJECT_ROOT, "experiments", "results")
+                os.makedirs(results_dir, exist_ok=True)
+                result_path = os.path.join(results_dir, f"{run_id}_{out['instance_id']}_s{int(seed)}.json")
+                with open(result_path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+                # 固定指针让 dashboard 在 Streamlit 重跑后仍读取刚才这一次。
+                with open(os.path.join(results_dir, "ui_last_result.json"), "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+                # 保存一条可追溯的 LLM/求解证据，时间线不再依赖手工生成文件。
+                from verify.evidence import new_record, append_round
+                evidence = new_record(
+                    iteration_id=1,
+                    stage="ui_run",
+                    llm_prompt_hash=llm_res.get("llm_prompt_hash", ""),
+                    generated_code=llm_res.get("generated_code", ""),
+                    static_check=llm_res.get("static_check", {}),
+                    execution={
+                        "status": "completed",
+                        "objective_value": out.get("objective_value"),
+                        "feasibility_rate": out.get("feasibility_rate"),
+                        "runtime_ms": out.get("runtime_ms"),
+                    },
+                    recovery_action=llm_res.get("recovery_action"),
+                )
+                evidence["run_id"] = run_id
+                evidence["instance_id"] = out["instance_id"]
+                evidence["attempts_log"] = llm_res.get("attempts_log", [])
+                append_round(run_id, evidence)
                 st.json(_json_safe({
                     "objective_value": out.get("objective_value"),
                     "feasibility_rate": out.get("feasibility_rate"),
                     "iterations": out.get("iterations"),
                     "runtime_ms": out.get("runtime_ms"),
+                    "startup_ms": out.get("startup_ms"),
+                    "timed_out": out.get("timed_out"),
+                    "timeout_reason": out.get("timeout_reason"),
+                    "budget_overrun_ms": out.get("budget_overrun_ms"),
                     "unassigned": out.get("unassigned"),
                     "recovery_action": llm_res.get("recovery_action"),
+                    "run_id": run_id,
                 }))
-                st.success(f"求解完成 | recovery: {llm_res.get('recovery_action')}")
+                if out.get("timed_out"):
+                    st.info(f"已到达时间预算，保留当前最优解（实际搜索 {out.get('runtime_ms')} ms）。")
+                else:
+                    st.success(f"求解完成 | recovery: {llm_res.get('recovery_action')}")
 
 elif tab == "可视化":
     from ui.dashboard import render_dashboard

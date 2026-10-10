@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections import Counter
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PARAMS_PATH = os.path.join(BASE, "..", "config", "params.json")
@@ -66,6 +67,40 @@ def drone_feasible(energy_wh: float, p: dict) -> bool:
 # ---- 约束检查器 ----------------------------------------------------
 def check_capacity(load_kg: float, capacity_kg: float) -> bool:
     return load_kg <= capacity_kg + 1e-9
+
+
+def validate_routes(paths, unassigned, instance, allow_unassigned=False) -> dict:
+    """核验仓库边界及客户完整性；破坏后的部分解可暂留未分配客户。"""
+    errors = []
+    if not isinstance(paths, (list, tuple)) or not isinstance(unassigned, (list, tuple)):
+        return {"passed": False, "errors": ["路径和未服务客户必须为列表"]}
+    customers = {n["id"] for n in instance["nodes"] if n["id"] != 0}
+    served = []
+    for index, path in enumerate(paths, 1):
+        if not isinstance(path, (list, tuple)) or len(path) < 2:
+            errors.append(f"路线 {index} 缺少仓库起终点")
+            continue
+        if not all(isinstance(n, int) and not isinstance(n, bool) for n in path):
+            errors.append(f"路线 {index} 包含无效节点编号")
+            continue
+        if path[0] != 0 or path[-1] != 0:
+            errors.append(f"路线 {index} 必须从仓库 0 出发并返回仓库 0")
+        if 0 in path[1:-1]:
+            errors.append(f"路线 {index} 内部出现仓库 0")
+        served.extend(n for n in path if n != 0)
+    if not all(isinstance(n, int) and not isinstance(n, bool) for n in unassigned):
+        errors.append("未服务客户包含无效节点编号")
+    else:
+        counts = Counter(served + list(unassigned))
+        if set(counts) - customers:
+            errors.append("包含未知节点或将仓库列为未服务客户")
+        if customers - set(counts):
+            errors.append("存在未列入路线或未服务列表的客户")
+        if any(count > 1 for count in counts.values()):
+            errors.append("客户重复出现，或同时列入路线和未服务列表")
+    if unassigned and not allow_unassigned:
+        errors.append("仍有未服务客户")
+    return {"passed": not errors, "errors": errors}
 
 
 class Solution:
