@@ -425,6 +425,9 @@ class ALNSSolver:
         self.results = {n: 0.0 for n in all_names}
         self.iteration = 0
         self.best = None
+        # 每次迭代保留轻量轨迹，供 UI 绘制真实收敛曲线。
+        self.history = []
+        self.current = None
         self._checkpoints = []
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -461,8 +464,9 @@ class ALNSSolver:
             return json.load(f)
 
     def run(self):
-        self.best = initial_solution(self.instance, self.rng, self.params)
         start = time.time()
+        self.best = initial_solution(self.instance, self.rng, self.params)
+        self.current = self.best.copy()
         while self.iteration < self.max_iter and (time.time() - start) < self.time_budget:
             # 破坏算子选择（自定义 LLM 算子以 "llm" 名注入）
             dpick = dict(self.destroy_set)
@@ -477,21 +481,34 @@ class ALNSSolver:
             rfn = rpick[rn]
             # 周期性强制跨路径 relocate（方案 2）：让 M1/M3 因成本梯度不同而分化
             if self.iteration % 3 == 0 and "relocate" in dpick:
-                removed, new = dpick["relocate"](self.best, self.instance, self.rng,
+                removed, new = dpick["relocate"](self.current, self.instance, self.rng,
                                                   k=2, params=self.params)
             else:
-                removed, partial = dfn(self.best, self.instance, self.rng, params=self.params)
+                removed, partial = dfn(self.current, self.instance, self.rng, params=self.params)
                 new = rfn(partial, self.instance, self.rng, params=self.params)
             improved = new.feasible and new.objective < self.best.objective
+            accepted = False
             if improved:
-                self.best = new
+                self.current = new
+                self.best = new.copy()
+                accepted = True
                 self.results[dn] += 2.0; self.results[rn] += 2.0
             else:  # 退火式接受（原型简化：概率接受略差解）
-                if new.objective <= self.best.objective * 1.02 and self.rng.random() < 0.3:
-                    self.best = new
+                if new.objective <= self.current.objective * 1.02 and self.rng.random() < 0.3:
+                    self.current = new
+                    accepted = True
                 self.results[dn] += 0.1; self.results[rn] += 0.1
                 self.weights[dn] *= 0.99; self.weights[rn] *= 0.99
             self.iteration += 1
+            self.history.append({
+                "iteration": self.iteration,
+                "objective": float(self.best.objective),
+                "candidate_objective": float(new.objective),
+                "accepted": accepted,
+                "feasible": bool(new.feasible),
+                "destroy_operator": dn,
+                "repair_operator": rn,
+            })
             if self.k and self.iteration % self.k == 0 and self.use_checkpoint:
                 self._save_checkpoint()
         if self.use_checkpoint and self.k:
@@ -500,6 +517,7 @@ class ALNSSolver:
 
     def _summary(self, start):
         return {
+            "instance_id": self.instance.get("instance_id"),
             "objective_value": self.best.objective,
             "feasibility_rate": 1.0 if self.best.feasible else 0.0,
             "unassigned": self.best.unassigned,
@@ -507,6 +525,9 @@ class ALNSSolver:
             "runtime_ms": int((time.time() - start) * 1000),
             "iterations": self.iteration,
             "weights": self.weights,
+            "operator_weights": self.weights,
+            "operator_results": self.results,
+            "history": self.history,
             "seed": self.seed,
         }
 

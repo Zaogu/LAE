@@ -43,18 +43,32 @@ def _load_evidence() -> list:
 
 def _load_latest_result() -> dict | None:
     res_dir = os.path.join(PROJECT_ROOT, "experiments", "results")
-    files = sorted(
-        glob.glob(os.path.join(res_dir, "A_*.json"))
-        + glob.glob(os.path.join(res_dir, "C_*.json"))
-    )
+    # UI 求解会写固定指针，优先使用它；否则兼容命令行实验结果。
+    files = [os.path.join(res_dir, "ui_last_result.json")]
+    files += glob.glob(os.path.join(res_dir, "ui_*.json"))
+    files += glob.glob(os.path.join(res_dir, "A_*.json"))
+    files += glob.glob(os.path.join(res_dir, "C_*.json"))
+    files = [p for p in files if os.path.isfile(p)]
     if not files:
         return None
-    try:
-        with open(files[-1], encoding="utf-8") as f:
-            obj = json.load(f)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        return None
+    for path in sorted(set(files), key=os.path.getmtime, reverse=True):
+        try:
+            with open(path, encoding="utf-8") as f:
+                obj = json.load(f)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _filter_evidence_for_result(recs: list, result: dict) -> list:
+    """避免旧运行的证据混进当前图表。旧证据没有 run_id 时保持兼容。"""
+    run_id = _safe_get(result, "run_id")
+    if not run_id:
+        return recs
+    matching = [r for r in recs if _safe_get(r, "run_id") == run_id]
+    return matching or recs
 
 
 def _load_instance(instance_id: str) -> dict | None:
@@ -150,6 +164,16 @@ def _view_convergence(recs: list, result: dict):
         vertical_spacing=0.3,
     )
 
+    # 优先使用求解器逐迭代 history；旧版本没有 history 时才退回 evidence。
+    history = _safe_get(result, "history", []) or []
+    if history:
+        fig.add_trace(go.Scatter(
+            x=[h.get("iteration") for h in history],
+            y=[h.get("objective") for h in history],
+            mode="lines",
+            name="best objective",
+        ), row=1, col=1)
+
     execs = []
     for r in recs:
         if not isinstance(r, dict):
@@ -158,35 +182,24 @@ def _view_convergence(recs: list, result: dict):
         if isinstance(exec_obj, dict) and exec_obj.get("objective_value") is not None:
             execs.append(r)
 
-    if execs:
+    if not history and execs:
         fig.add_trace(go.Scatter(
             x=[_safe_get(e, "iteration_id", None) for e in execs],
             y=[_safe_get(_safe_get(e, "execution", {}), "objective_value", None) for e in execs],
             mode="lines+markers",
             name="objective",
         ), row=1, col=1)
-    else:
-        iterations = _safe_get(result, "iterations", 0) or 0
-        if isinstance(iterations, (int, float)) and iterations > 0:
-            fig.add_trace(go.Scatter(
-                x=list(range(int(iterations))),
-                y=[_safe_get(result, "objective_value", 0.0)] * int(iterations),
-                mode="lines",
-                name="objective (flat placeholder)",
-            ), row=1, col=1)
+    elif not history:
+        # 没有历史时显示明确状态，而不是伪造一条“平直收敛曲线”。
+        fig.add_annotation(row=1, col=1, text="当前运行没有保存迭代轨迹", showarrow=False)
 
-    op_res = _safe_get(result, "operator_results", None)
+    op_res = _safe_get(result, "operator_results", None) or _safe_get(result, "results", None)
     if op_res and isinstance(op_res, dict):
         names = list(op_res.keys())
         mat = [[op_res[n]] for n in names]
         fig.add_trace(go.Heatmap(z=mat, x=["contribution"], y=names), row=2, col=1)
     else:
-        fig.add_trace(go.Scatter(
-            x=[0],
-            y=[0],
-            mode="markers",
-            text="无算子热力数据（当前结果未包含 operator_results）",
-        ), row=2, col=1)
+        fig.add_annotation(row=2, col=1, text="当前运行没有算子贡献记录", showarrow=False)
 
     fig.update_layout(height=600, title="收敛曲线与算子贡献")
     return fig
@@ -217,7 +230,13 @@ def _view_llm_timeline(recs: list):
     if not rows:
         st.info("evidence 记录中未解析到有效行。")
         return
-    st.dataframe(rows, use_container_width=True)
+    # Streamlit 的 dataframe 依赖 pyarrow；部分旧环境中 pyarrow 与项目的
+    # NumPy 1.x 版本不兼容。时间线本身是诊断信息，降级为 JSON 仍保留全部内容。
+    try:
+        st.dataframe(rows, use_container_width=True)
+    except (ImportError, ModuleNotFoundError):
+        st.info("当前环境的表格依赖不可用，以下为同一份时间线数据：")
+        st.json(rows)
 
 
 def _view_3d(instance: dict | None, result: dict):
@@ -329,10 +348,16 @@ def render_dashboard():
     st.subheader("可视化四视图 + 证据导出（T-15）")
     recs = _load_evidence()
     result = _load_latest_result() or {}
+    recs = _filter_evidence_for_result(recs, result)
     inst_id = _safe_get(result, "instance_id", "")
     inst = _load_instance(inst_id) if inst_id else None
     if not inst:
         inst = _default_instance()
+
+    if result:
+        st.caption(f"当前结果：{_safe_get(result, 'instance_name', _safe_get(result, 'instance_id', '未知实例'))} | 运行编号：{_safe_get(result, 'run_id', '历史结果')}")
+    else:
+        st.warning("尚未找到求解结果，请先在“求解”页运行一个实例。")
 
     st.markdown("### 视图 1：路径地图")
     fig1 = _view_path_map(result, inst)
