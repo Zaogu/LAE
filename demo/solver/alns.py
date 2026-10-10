@@ -21,12 +21,46 @@ import os
 import json
 import random
 import time
+import inspect
+from contextvars import ContextVar
 
 from solver.model import Solution, load_params, truck_energy, drone_energy, drone_feasible, validate_routes
 import numpy as np
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(BASE, "..", "checkpoints")
+
+
+class BudgetExceeded(RuntimeError):
+    """协作式时间预算到期；由主循环捕获并返回当前最优解。"""
+
+
+_deadline = ContextVar("alns_deadline", default=None)
+
+
+def check_deadline() -> None:
+    """供内置算子和受控自定义算子在循环中检查剩余时间。"""
+    deadline = _deadline.get()
+    if deadline is not None and time.perf_counter() >= deadline:
+        raise BudgetExceeded("time budget reached")
+
+
+def _deadline_value() -> float | None:
+    return _deadline.get()
+
+
+def _call_operator(fn, solution, instance, rng, **kwargs):
+    """兼容旧的三参数算子，同时把 deadline 等扩展参数传给 **kwargs 算子。"""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(solution, instance, rng, **kwargs)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD
+           for p in signature.parameters.values()):
+        return fn(solution, instance, rng, **kwargs)
+    accepted = {key: value for key, value in kwargs.items()
+                if key in signature.parameters}
+    return fn(solution, instance, rng, **accepted)
 
 
 # ---- 目标评估 ------------------------------------------------------
@@ -49,9 +83,13 @@ def evaluate(solution, instance, params, rng=None):
     total = 0.0
     feasible = True
 
-    for path in solution.paths:
+    for path_index, path in enumerate(solution.paths):
+        if path_index % 2 == 0:
+            check_deadline()
         load = (len(path) - 1) * 5.0  # 每客户 5kg（原型假设；仓库不计载重）
         for idx in range(len(path) - 1):
+            if idx % 64 == 0:
+                check_deadline()
             i, j = path[idx], path[idx + 1]
             total += seg_cost_fast(ctx, p, i, j, load)
             load = max(0.0, load - 5.0)
@@ -60,6 +98,7 @@ def evaluate(solution, instance, params, rng=None):
     tw = instance.get("time_windows", {})
     dur_per_hour = tP.get("phi_per_hour", 0.0)
     for path in solution.paths:
+        check_deadline()
         duration = len(path) * 2.0  # 分钟近似
         if duration > tw.get("end", 1e9):
             total += dur_per_hour * (duration - tw["end"]) / 60.0
@@ -102,6 +141,8 @@ def initial_solution(instance, rng, params=None):
     # 把客户随机划分成 n_truck 桶（近似均衡）
     buckets = [[] for _ in range(n_truck)]
     for i, c in enumerate(cust):
+        if i % 64 == 0:
+            check_deadline()
         buckets[i % n_truck].append(c)
 
     paths = []
@@ -113,6 +154,8 @@ def initial_solution(instance, rng, params=None):
         cur_idx = nmap.get(0, 0)
         remaining = list(b)
         while remaining:
+            if len(remaining) % 64 == 0:
+                check_deadline()
             rem_pos = np.asarray([nmap.get(r, 0) for r in remaining])
             k = int(np.argmin(dist[cur_idx, rem_pos]))
             nxt = remaining[k]
@@ -222,6 +265,7 @@ def _path_cost_fast(ctx, params, path):
 
 # ---- 预置破坏算子（FR-4）----------------------------------------
 def _remove_cost(sol, instance, params, i):
+    check_deadline()
     ev_before = sol.objective
     trial = sol.copy()
     trial.paths = [_drop(p, {i}) for p in trial.paths]
@@ -231,6 +275,7 @@ def _remove_cost(sol, instance, params, i):
 
 
 def destroy_random(sol, instance, rng, k=2, **kw):
+    check_deadline()
     served = [i for p in sol.paths for i in p if i != 0]
     removed = rng.sample(served, min(k, len(served)))
     partial = sol.copy()
@@ -242,7 +287,12 @@ def destroy_random(sol, instance, rng, k=2, **kw):
 
 def destroy_worst(sol, instance, rng, k=2, **kw):
     params = kw.get("params") or load_params()
-    served = sorted({i for p in sol.paths for i in p if i != 0},
+    served = list({i for p in sol.paths for i in p if i != 0})
+    max_candidates = int(kw.get("max_worst_candidates", 128))
+    if len(served) > max_candidates:
+        served = rng.sample(served, max_candidates)
+    check_deadline()
+    served = sorted(served,
                     key=lambda i: -_remove_cost(sol, instance, params, i))
     removed = served[:k]
     partial = sol.copy()
@@ -255,6 +305,7 @@ def destroy_worst(sol, instance, rng, k=2, **kw):
 def destroy_shaw(sol, instance, rng, k=3, **kw):
     """相关移除：按坐标近邻 + 相同时间窗聚集（原型简化为坐标近邻聚类）。"""
     served = [i for p in sol.paths for i in p if i != 0]
+    check_deadline()
     if not served:
         return [], sol
     seed_i = rng.choice(served)
@@ -285,6 +336,7 @@ def destroy_relocate(sol, instance, rng, k=2, **kw):
     partial 为已重放的解（repair 阶段可视为无操作或再优化）。
     """
     params = kw.get("params") or load_params()
+    check_deadline()
     served = [i for p in sol.paths for i in p if i != 0]
     if not served or len(sol.paths) < 2:
         # 退化为普通 random（单路径时无法跨路径 relocate）
@@ -322,13 +374,15 @@ def repair_greedy(partial, instance, rng, **kw):
     removed = list(partial.unassigned)
     new = partial.copy(); new.unassigned = []
     for i in removed:
-        _greedy_insert(new, i, instance, params, rng=rng)
+        check_deadline()
+        _greedy_insert(new, i, instance, params, rng=rng,
+                       max_cands=int(kw.get("max_cands", 64)))
     ev = evaluate(new, instance, params)
     new.objective, new.feasible = ev["objective"], ev["feasible"]
     return new
 
 
-def _greedy_insert(sol, i, instance, params, rng=None, max_cands=200):
+def _greedy_insert(sol, i, instance, params, rng=None, max_cands=64):
     """贪心插入：每条 path 取 ≤ max_cands 个候选位（端点必含 + 随机采样），避免 O(n²) 全位枚举。"""
     best = None; bestd = None
     for pi, path in enumerate(sol.paths):
@@ -342,7 +396,9 @@ def _greedy_insert(sol, i, instance, params, rng=None, max_cands=200):
             if rng is not None and n > 3:
                 cand_pos += rng.sample(range(1, n - 2), min(max_cands - 2, n - 3))
             cand_pos = sorted(set(cand_pos))
-        for pos in cand_pos:
+        for pos_index, pos in enumerate(cand_pos):
+            if pos_index % 32 == 0:
+                check_deadline()
             obj_after = _obj_with_insert(sol, path, pos, i, instance, params)
             if bestd is None or obj_after < bestd:
                 bestd = obj_after; best = (pi, pos)
@@ -380,6 +436,7 @@ def repair_regret2(partial, instance, rng, **kw):
     removed = list(partial.unassigned)
     new = partial.copy(); new.unassigned = []
     while removed:
+        check_deadline()
         regrets = []
         for i in removed:
             costs = []
@@ -387,14 +444,17 @@ def repair_regret2(partial, instance, rng, **kw):
                 n = len(path)
                 if n < 2:
                     continue
-                if n <= 100:
+                max_cands = int(kw.get("max_cands", 64))
+                if n <= max_cands + 1:
                     cand = list(range(n - 1))
                 else:
                     cand = [0, n - 2]
                     if n > 3:
-                        cand += rng.sample(range(1, n - 2), 98)
+                        cand += rng.sample(range(1, n - 2), max_cands - 2)
                     cand = sorted(set(cand))
-                for pos in cand:
+                for pos_index, pos in enumerate(cand):
+                    if pos_index % 32 == 0:
+                        check_deadline()
                     costs.append(_obj_with_insert(new, path, pos, i, instance, params))
             if len(costs) >= 2:
                 costs.sort()
@@ -404,7 +464,8 @@ def repair_regret2(partial, instance, rng, **kw):
             else:
                 regrets.append((0.0, i))
         regrets.sort(reverse=True)
-        i = regrets[0][1]; _greedy_insert(new, i, instance, params)
+        i = regrets[0][1]; _greedy_insert(new, i, instance, params, rng=rng,
+                                           max_cands=int(kw.get("max_cands", 64)))
         removed.remove(i)
     ev = evaluate(new, instance, params)
     new.objective, new.feasible = ev["objective"], ev["feasible"]
@@ -419,12 +480,15 @@ class ALNSSolver:
     def __init__(self, instance, params=None, rng=None, seed=42,
                  destroy_set=None, repair_set=None,
                  time_budget=60.0, max_iter=10000, checkpoint_interval=100,
-                 destroy_fn=None, repair_fn=None, use_checkpoint=True):
+                 destroy_fn=None, repair_fn=None, use_checkpoint=True,
+                 time_safety_margin=0.5, max_custom_removed=8):
         self.instance = instance
         self.params = params or load_params()
         self.rng = rng or random.Random(seed)
         self.seed = seed
         self.time_budget = time_budget
+        self.time_safety_margin = max(0.0, float(time_safety_margin))
+        self.max_custom_removed = max(1, int(max_custom_removed))
         self.max_iter = max_iter
         self.k = checkpoint_interval
         self.use_checkpoint = use_checkpoint
@@ -447,6 +511,10 @@ class ALNSSolver:
         self.current = None
         self.initial_objective = None
         self.invalid_candidates = 0
+        self.timed_out = False
+        self.timeout_reason = None
+        self.startup_ms = 0
+        self.budget_overrun_ms = 0
         self._checkpoints = []
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -469,8 +537,12 @@ class ALNSSolver:
               "paths": self.best.paths, "unassigned": self.best.unassigned,
               "timestamp": time.time()}
         cp_path = os.path.join(CHECKPOINT_DIR, f"ckpt_{self.instance['instance_id']}.json")
-        with open(cp_path, "w", encoding="utf-8") as f:
-            json.dump(cp, f, ensure_ascii=False, default=str)
+        try:
+            with open(cp_path, "w", encoding="utf-8") as f:
+                json.dump(cp, f, ensure_ascii=False, default=str)
+        except PermissionError:
+            # 旧的 Streamlit/实验进程可能暂时占用检查点文件；结果本身仍可返回。
+            return None
         self._checkpoints.append(cp_path)
         return cp_path
 
@@ -483,95 +555,128 @@ class ALNSSolver:
             return json.load(f)
 
     def run(self):
-        start = time.time()
+        start = time.perf_counter()
+        budget = max(0.0, float(self.time_budget))
+        # 初始解必须完整；startup_ms 单独记录，避免因极小预算返回空结果。
         self.best = initial_solution(self.instance, self.rng, self.params)
         initial_eval = evaluate(self.best, self.instance, self.params)
         if not initial_eval["feasible"] or not math.isfinite(initial_eval["objective"]):
             raise ValueError("初始路线未通过完整性检查")
         self.best.objective = initial_eval["objective"]
         self.best.feasible = initial_eval["feasible"]
+        self.startup_ms = int((time.perf_counter() - start) * 1000)
+        margin = min(self.time_safety_margin, budget * 0.02) if budget else 0.0
+        deadline = start + max(0.0, budget - margin)
+        token = _deadline.set(deadline)
         self.current = self.best.copy()
         self.initial_objective = float(self.best.objective)
         self.history = [{
             "iteration": 0, "objective": self.initial_objective,
             "current_objective": self.initial_objective,
-            "elapsed_ms": int((time.time() - start) * 1000),
+            "elapsed_ms": int((time.perf_counter() - start) * 1000),
         }]
-        while self.iteration < self.max_iter and (time.time() - start) < self.time_budget:
-            # 破坏算子选择（自定义 LLM 算子以 "llm" 名注入）
-            dpick = dict(self.destroy_set)
-            if self.custom_destroy:
-                dpick["llm"] = self.custom_destroy
-            dn = self._pick(dpick)
-            rpick = dict(self.repair_set)
-            if self.custom_repair:
-                rpick["llm"] = self.custom_repair
-            rn = self._pick(rpick)
-            dfn = dpick[dn]
-            rfn = rpick[rn]
-            # 算子可能原地修改输入；隔离候选，保护已接受路线和最优解。
-            candidate = self.current.copy()
-            # 周期性强制跨路径 relocate（方案 2）：让 M1/M3 因成本梯度不同而分化
-            if self.iteration % 3 == 0 and "relocate" in dpick:
-                # 记录真正执行的 relocate，修复算子在这轮没有调用。
-                dn, rn = "relocate", None
-                removed, new = dpick[dn](candidate, self.instance, self.rng,
-                                                  k=2, params=self.params)
-            else:
-                removed, partial = dfn(candidate, self.instance, self.rng, params=self.params)
-                validation = validate_routes(getattr(partial, "paths", None),
-                                             getattr(partial, "unassigned", None),
-                                             self.instance, allow_unassigned=True)
-                if validation["passed"]:
-                    new = rfn(partial, self.instance, self.rng, params=self.params)
+        try:
+            while self.iteration < self.max_iter and time.perf_counter() < deadline:
+                dpick = dict(self.destroy_set)
+                if self.custom_destroy:
+                    dpick["llm"] = self.custom_destroy
+                dn = self._pick(dpick)
+                rpick = dict(self.repair_set)
+                if self.custom_repair:
+                    rpick["llm"] = self.custom_repair
+                rn = self._pick(rpick)
+                dfn, rfn = dpick[dn], rpick[rn]
+                candidate = self.current.copy()
+                try:
+                    if self.iteration % 3 == 0 and "relocate" in dpick and len(candidate.paths) >= 2:
+                        # 记录真正执行的 relocate；这一轮没有调用 repair。
+                        dn, rn = "relocate", None
+                        removed, new = _call_operator(
+                            dpick[dn], candidate, self.instance, self.rng,
+                            k=2, params=self.params, deadline=deadline)
+                    else:
+                        removed, partial = _call_operator(
+                            dfn, candidate, self.instance, self.rng,
+                            params=self.params, deadline=deadline,
+                            max_remove=self.max_custom_removed if dn == "llm" else None)
+                        if dn == "llm":
+                            # LLM 算子只负责选择客户；重建部分解并限制移除量，避免
+                            # 一次拿走 8% 客户后让修复算子超时或破坏仓库边界。
+                            served = {x for p in candidate.paths for x in p if x != 0}
+                            chosen = []
+                            for item in (removed or []):
+                                if item in served and item not in chosen:
+                                    chosen.append(item)
+                                if len(chosen) >= self.max_custom_removed:
+                                    break
+                            partial = candidate.copy()
+                            partial.paths = [list(_drop(p, set(chosen))) for p in partial.paths]
+                            partial.unassigned = list(candidate.unassigned) + chosen
+                        validation = validate_routes(
+                            getattr(partial, "paths", None),
+                            getattr(partial, "unassigned", None),
+                            self.instance, allow_unassigned=True)
+                        if validation["passed"]:
+                            new = _call_operator(
+                                rfn, partial, self.instance, self.rng,
+                                params=self.params, deadline=deadline, max_cands=64)
+                        else:
+                            # 非法部分解直接拦截，不交给修复算子制造虚假收益。
+                            new, rn = partial, None
+                    ev = evaluate(new, self.instance, self.params)
+                except BudgetExceeded:
+                    self.timed_out = True
+                    self.timeout_reason = "算子或候选评估达到时间预算"
+                    break
+                candidate_objective = float(ev["objective"])
+                candidate_feasible = bool(ev["feasible"]) and math.isfinite(candidate_objective)
+                if candidate_feasible:
+                    new = Solution([list(p) for p in new.paths], list(new.unassigned),
+                                   candidate_objective, True)
                 else:
-                    # 非法部分解直接拦截，不交给修复算子制造虚假收益。
-                    new, rn = partial, None
-            ev = evaluate(new, self.instance, self.params)
-            candidate_objective = float(ev["objective"])
-            candidate_feasible = bool(ev["feasible"]) and math.isfinite(candidate_objective)
-            if candidate_feasible:
-                new = Solution([list(p) for p in new.paths], list(new.unassigned),
-                               candidate_objective, True)
-            else:
-                self.invalid_candidates += 1
-            old_best = self.best.objective
-            improved = candidate_feasible and candidate_objective < old_best
-            accepted = False
-            if improved:
-                self.current = new
-                self.best = new.copy()
-                accepted = True
-            else:  # 退火式接受（原型简化：概率接受略差解）
-                if candidate_feasible and (candidate_objective <= self.current.objective or (
+                    self.invalid_candidates += 1
+                old_best = self.best.objective
+                improved = candidate_feasible and candidate_objective < old_best
+                accepted = False
+                if improved:
+                    self.current = new
+                    self.best = new.copy()
+                    accepted = True
+                elif candidate_feasible and (candidate_objective <= self.current.objective or (
                         candidate_objective <= self.current.objective * 1.02 and self.rng.random() < 0.3)):
                     self.current = new
                     accepted = True
-            gain = max(0.0, float(old_best - self.best.objective))
-            for name in {dn, rn} - {None}:
-                self.results[name] += 2.0 if improved else 0.1
-                stats = self.operator_stats[name]
-                stats["calls"] += 1
-                stats["improvements"] += int(improved)
-                stats["improvement_total"] += gain
-                self.weights[name] = self.weights[name] * (1.1 if improved else 0.99)
-            self.iteration += 1
-            self.history.append({
-                "iteration": self.iteration,
-                "objective": float(self.best.objective),
-                "candidate_objective": candidate_objective if math.isfinite(candidate_objective) else None,
-                "current_objective": float(self.current.objective),
-                "elapsed_ms": int((time.time() - start) * 1000),
-                "accepted": accepted,
-                "feasible": candidate_feasible,
-                "validation_errors": ev.get("validation_errors", []),
-                "destroy_operator": dn,
-                "repair_operator": rn,
-            })
-            if self.k and self.iteration % self.k == 0 and self.use_checkpoint:
-                self._save_checkpoint()
-        if self.use_checkpoint and self.k:
+                gain = max(0.0, float(old_best - self.best.objective))
+                for name in {dn, rn} - {None}:
+                    self.results[name] += 2.0 if improved else 0.1
+                    stats = self.operator_stats[name]
+                    stats["calls"] += 1
+                    stats["improvements"] += int(improved)
+                    stats["improvement_total"] += gain
+                    self.weights[name] = self.weights[name] * (1.1 if improved else 0.99)
+                self.iteration += 1
+                self.history.append({
+                    "iteration": self.iteration,
+                    "objective": float(self.best.objective),
+                    "candidate_objective": candidate_objective if math.isfinite(candidate_objective) else None,
+                    "current_objective": float(self.current.objective),
+                    "elapsed_ms": int((time.perf_counter() - start) * 1000),
+                    "accepted": accepted,
+                    "feasible": candidate_feasible,
+                    "validation_errors": ev.get("validation_errors", []),
+                    "destroy_operator": dn,
+                    "repair_operator": rn,
+                })
+                if self.k and self.iteration % self.k == 0 and self.use_checkpoint:
+                    self._save_checkpoint()
+        finally:
+            _deadline.reset(token)
+        if not self.timed_out and time.perf_counter() >= deadline:
+            self.timed_out = True
+            self.timeout_reason = "达到时间预算"
+        if self.use_checkpoint and self.k and self.best is not None:
             self._save_checkpoint()
+        self.budget_overrun_ms = max(0, int((time.perf_counter() - start - budget) * 1000))
         return self._summary(start)
 
     def _summary(self, start):
@@ -582,8 +687,12 @@ class ALNSSolver:
             "feasibility_rate": 1.0 if self.best.feasible else 0.0,
             "unassigned": self.best.unassigned,
             "paths": self.best.paths,
-            "runtime_ms": int((time.time() - start) * 1000),
+            "runtime_ms": int((time.perf_counter() - start) * 1000),
             "iterations": self.iteration,
+            "startup_ms": self.startup_ms,
+            "timed_out": self.timed_out,
+            "timeout_reason": self.timeout_reason,
+            "budget_overrun_ms": self.budget_overrun_ms,
             "invalid_candidates": self.invalid_candidates,
             "route_validation": validate_routes(self.best.paths, self.best.unassigned, self.instance),
             "weights": self.weights,

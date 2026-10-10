@@ -77,6 +77,10 @@ def run_group_a(instance: dict, seed: int, time_budget: float,
         "operator_weights": out.get("operator_weights", {}),
         "operator_stats": out.get("operator_stats", {}),
         "initial_objective": out.get("initial_objective"),
+        "startup_ms": out.get("startup_ms"),
+        "timed_out": out.get("timed_out"),
+        "timeout_reason": out.get("timeout_reason"),
+        "budget_overrun_ms": out.get("budget_overrun_ms"),
     }
 
 
@@ -114,7 +118,11 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                        "operator_results": out.get("operator_results", {}),
                        "operator_weights": out.get("operator_weights", {}),
                        "operator_stats": out.get("operator_stats", {}),
-                       "initial_objective": out.get("initial_objective")})
+                       "initial_objective": out.get("initial_objective"),
+                       "startup_ms": out.get("startup_ms"),
+                       "timed_out": out.get("timed_out"),
+                       "timeout_reason": out.get("timeout_reason"),
+                       "budget_overrun_ms": out.get("budget_overrun_ms")})
         return result
 
     # LLM 可用：生成"完整求解器"（比 C 组更大的自由度，无静态检查）
@@ -139,7 +147,11 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                            "operator_results": out.get("operator_results", {}),
                            "operator_weights": out.get("operator_weights", {}),
                            "operator_stats": out.get("operator_stats", {}),
-                           "initial_objective": out.get("initial_objective")})
+                           "initial_objective": out.get("initial_objective"),
+                           "startup_ms": out.get("startup_ms"),
+                           "timed_out": out.get("timed_out"),
+                           "timeout_reason": out.get("timeout_reason"),
+                           "budget_overrun_ms": out.get("budget_overrun_ms")})
             result["recovery_action"] = "llm_only_ok"
         else:
             result["llm_only_infeasible"] = True
@@ -157,7 +169,11 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                            "operator_results": out.get("operator_results", {}),
                            "operator_weights": out.get("operator_weights", {}),
                            "operator_stats": out.get("operator_stats", {}),
-                           "initial_objective": out.get("initial_objective")})
+                           "initial_objective": out.get("initial_objective"),
+                           "startup_ms": out.get("startup_ms"),
+                           "timed_out": out.get("timed_out"),
+                           "timeout_reason": out.get("timeout_reason"),
+                           "budget_overrun_ms": out.get("budget_overrun_ms")})
     else:
         result["llm_only_infeasible"] = True
         result["error"] = res["error"]
@@ -173,7 +189,11 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                        "operator_results": out.get("operator_results", {}),
                        "operator_weights": out.get("operator_weights", {}),
                        "operator_stats": out.get("operator_stats", {}),
-                       "initial_objective": out.get("initial_objective")})
+                       "initial_objective": out.get("initial_objective"),
+                       "startup_ms": out.get("startup_ms"),
+                       "timed_out": out.get("timed_out"),
+                       "timeout_reason": out.get("timeout_reason"),
+                       "budget_overrun_ms": out.get("budget_overrun_ms")})
     return result
 
 
@@ -206,6 +226,10 @@ def run_group_c(instance: dict, seed: int, time_budget: float,
         "operator_weights": out.get("operator_weights", {}),
         "operator_stats": out.get("operator_stats", {}),
         "initial_objective": out.get("initial_objective"),
+        "startup_ms": out.get("startup_ms"),
+        "timed_out": out.get("timed_out"),
+        "timeout_reason": out.get("timeout_reason"),
+        "budget_overrun_ms": out.get("budget_overrun_ms"),
         "recovery_action": loop_res["recovery_action"],
         "llm_code": loop_res.get("generated_code", ""),
         "attempts": loop_res.get("attempts_log", []),

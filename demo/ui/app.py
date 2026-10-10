@@ -49,7 +49,7 @@ elif tab == "求解":
     else:
         sel = st.selectbox("选择实例", insts)
         tb = st.number_input("时间预算 (s)", min_value=5, max_value=300, value=30, step=5,
-                             help="路线优化的计算时间。AI 接口等待和结果保存额外耗时，单次迭代完成后才检查限时。")
+                             help="ALNS 路线搜索预算。程序会在接近限时时停止新一轮搜索；AI 接口等待和结果保存属于额外耗时。")
         seed = st.number_input("随机种子", min_value=0, max_value=99999, value=1, step=1)
         if st.button("运行求解"):
             with st.spinner("ALNS 求解中..."):
@@ -117,11 +117,18 @@ elif tab == "求解":
                     "feasibility_rate": out.get("feasibility_rate"),
                     "iterations": out.get("iterations"),
                     "runtime_ms": out.get("runtime_ms"),
+                    "startup_ms": out.get("startup_ms"),
+                    "timed_out": out.get("timed_out"),
+                    "timeout_reason": out.get("timeout_reason"),
+                    "budget_overrun_ms": out.get("budget_overrun_ms"),
                     "unassigned": out.get("unassigned"),
                     "recovery_action": llm_res.get("recovery_action"),
                     "run_id": run_id,
                 }))
-                st.success(f"求解完成 | recovery: {llm_res.get('recovery_action')}")
+                if out.get("timed_out"):
+                    st.info(f"已到达时间预算，保留当前最优解（实际搜索 {out.get('runtime_ms')} ms）。")
+                else:
+                    st.success(f"求解完成 | recovery: {llm_res.get('recovery_action')}")
 
 elif tab == "可视化":
     from ui.dashboard import render_dashboard

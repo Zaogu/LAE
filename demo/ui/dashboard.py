@@ -402,6 +402,9 @@ def render_dashboard():
 
     if result:
         st.caption(f"当前结果：{_safe_get(result, 'instance_name', _safe_get(result, 'instance_id', '未知实例'))} | 运行编号：{_safe_get(result, 'run_id', '历史结果')}")
+        if result.get("timed_out"):
+            st.info(f"本次搜索在时间预算附近停止，保留当前最优解；搜索耗时 {result.get('runtime_ms')} ms。"
+                    "AI 接口等待和结果保存不计入 ALNS 搜索预算。")
         if inst:
             from solver.model import validate_routes
             validation = validate_routes(result.get("paths"), result.get("unassigned"), inst)
