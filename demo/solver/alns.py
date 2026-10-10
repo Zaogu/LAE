@@ -22,7 +22,7 @@ import json
 import random
 import time
 
-from solver.model import Solution, load_params, truck_energy, drone_energy, drone_feasible
+from solver.model import Solution, load_params, truck_energy, drone_energy, drone_feasible, validate_routes
 import numpy as np
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +37,12 @@ def evaluate(solution, instance, params, rng=None):
     载重 u 随服务递减，影响能耗（动态载荷耦合）。
     性能（T-14）：段代价走 numpy 距离矩阵 + 系数缓存（seg_cost_fast）。
     """
+    validation = validate_routes(getattr(solution, "paths", None),
+                                 getattr(solution, "unassigned", None), instance,
+                                 allow_unassigned=True)
+    if not validation["passed"]:
+        return {"objective": float("inf"), "feasible": False,
+                "validation_errors": validation["errors"]}
     p = params
     cP, tP = p["cost_params"], p["time_window"]
     ctx = get_eval_ctx(instance, p)
@@ -61,7 +67,8 @@ def evaluate(solution, instance, params, rng=None):
     # 未服务惩罚
     total += cP["unassigned_penalty"] * len(solution.unassigned)
 
-    return {"objective": round(total, 4), "feasible": feasible and len(solution.unassigned) == 0}
+    return {"objective": round(total, 4), "feasible": feasible and len(solution.unassigned) == 0,
+            "validation_errors": []}
 
 
 
@@ -217,7 +224,7 @@ def _path_cost_fast(ctx, params, path):
 def _remove_cost(sol, instance, params, i):
     ev_before = sol.objective
     trial = sol.copy()
-    trial.paths = [p for p in trial.paths if i not in p]
+    trial.paths = [_drop(p, {i}) for p in trial.paths]
     trial.unassigned = list(trial.unassigned) + [i]
     ev = evaluate(trial, instance, params)
     return ev["objective"] - ev_before
@@ -326,12 +333,14 @@ def _greedy_insert(sol, i, instance, params, rng=None, max_cands=200):
     best = None; bestd = None
     for pi, path in enumerate(sol.paths):
         n = len(path)
+        if n < 2:
+            continue
         if n <= max_cands + 1:
-            cand_pos = list(range(n))
+            cand_pos = list(range(n - 1))
         else:
-            cand_pos = [0, n - 1]
+            cand_pos = [0, n - 2]
             if rng is not None and n > 3:
-                cand_pos += rng.sample(range(1, n - 1), min(max_cands - 2, n - 2))
+                cand_pos += rng.sample(range(1, n - 2), min(max_cands - 2, n - 3))
             cand_pos = sorted(set(cand_pos))
         for pos in cand_pos:
             obj_after = _obj_with_insert(sol, path, pos, i, instance, params)
@@ -349,6 +358,8 @@ def _obj_with_insert(sol, path, pos, i, instance, params):
     仅评估受影响的两段（predecessor->i 和 i->successor）+ 被替换的旧段，
     其余段与 sol.objective 保持一致。
     """
+    if not 0 <= pos < len(path) - 1:
+        raise ValueError("插入位置必须位于仓库起终点之间")
     ctx = get_eval_ctx(instance, params)
     base = sol.objective
     # 该 path 的旧目标贡献（重算该 path 全部段，其余 path 不变）
@@ -374,12 +385,14 @@ def repair_regret2(partial, instance, rng, **kw):
             costs = []
             for pi, path in enumerate(new.paths):
                 n = len(path)
+                if n < 2:
+                    continue
                 if n <= 100:
-                    cand = list(range(n))
+                    cand = list(range(n - 1))
                 else:
-                    cand = [0, n - 1]
+                    cand = [0, n - 2]
                     if n > 3:
-                        cand += rng.sample(range(1, n - 1), 98)
+                        cand += rng.sample(range(1, n - 2), 98)
                     cand = sorted(set(cand))
                 for pos in cand:
                     costs.append(_obj_with_insert(new, path, pos, i, instance, params))
@@ -433,6 +446,7 @@ class ALNSSolver:
         self.history = []
         self.current = None
         self.initial_objective = None
+        self.invalid_candidates = 0
         self._checkpoints = []
         os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -471,6 +485,11 @@ class ALNSSolver:
     def run(self):
         start = time.time()
         self.best = initial_solution(self.instance, self.rng, self.params)
+        initial_eval = evaluate(self.best, self.instance, self.params)
+        if not initial_eval["feasible"] or not math.isfinite(initial_eval["objective"]):
+            raise ValueError("初始路线未通过完整性检查")
+        self.best.objective = initial_eval["objective"]
+        self.best.feasible = initial_eval["feasible"]
         self.current = self.best.copy()
         self.initial_objective = float(self.best.objective)
         self.history = [{
@@ -490,25 +509,42 @@ class ALNSSolver:
             rn = self._pick(rpick)
             dfn = dpick[dn]
             rfn = rpick[rn]
+            # 算子可能原地修改输入；隔离候选，保护已接受路线和最优解。
+            candidate = self.current.copy()
             # 周期性强制跨路径 relocate（方案 2）：让 M1/M3 因成本梯度不同而分化
             if self.iteration % 3 == 0 and "relocate" in dpick:
                 # 记录真正执行的 relocate，修复算子在这轮没有调用。
                 dn, rn = "relocate", None
-                removed, new = dpick[dn](self.current, self.instance, self.rng,
+                removed, new = dpick[dn](candidate, self.instance, self.rng,
                                                   k=2, params=self.params)
             else:
-                removed, partial = dfn(self.current, self.instance, self.rng, params=self.params)
-                new = rfn(partial, self.instance, self.rng, params=self.params)
+                removed, partial = dfn(candidate, self.instance, self.rng, params=self.params)
+                validation = validate_routes(getattr(partial, "paths", None),
+                                             getattr(partial, "unassigned", None),
+                                             self.instance, allow_unassigned=True)
+                if validation["passed"]:
+                    new = rfn(partial, self.instance, self.rng, params=self.params)
+                else:
+                    # 非法部分解直接拦截，不交给修复算子制造虚假收益。
+                    new, rn = partial, None
+            ev = evaluate(new, self.instance, self.params)
+            candidate_objective = float(ev["objective"])
+            candidate_feasible = bool(ev["feasible"]) and math.isfinite(candidate_objective)
+            if candidate_feasible:
+                new = Solution([list(p) for p in new.paths], list(new.unassigned),
+                               candidate_objective, True)
+            else:
+                self.invalid_candidates += 1
             old_best = self.best.objective
-            improved = new.feasible and (not self.best.feasible or new.objective < old_best)
+            improved = candidate_feasible and candidate_objective < old_best
             accepted = False
             if improved:
                 self.current = new
                 self.best = new.copy()
                 accepted = True
             else:  # 退火式接受（原型简化：概率接受略差解）
-                if new.feasible and (new.objective <= self.current.objective or (
-                        new.objective <= self.current.objective * 1.02 and self.rng.random() < 0.3)):
+                if candidate_feasible and (candidate_objective <= self.current.objective or (
+                        candidate_objective <= self.current.objective * 1.02 and self.rng.random() < 0.3)):
                     self.current = new
                     accepted = True
             gain = max(0.0, float(old_best - self.best.objective))
@@ -523,11 +559,12 @@ class ALNSSolver:
             self.history.append({
                 "iteration": self.iteration,
                 "objective": float(self.best.objective),
-                "candidate_objective": float(new.objective),
+                "candidate_objective": candidate_objective if math.isfinite(candidate_objective) else None,
                 "current_objective": float(self.current.objective),
                 "elapsed_ms": int((time.time() - start) * 1000),
                 "accepted": accepted,
-                "feasible": bool(new.feasible),
+                "feasible": candidate_feasible,
+                "validation_errors": ev.get("validation_errors", []),
                 "destroy_operator": dn,
                 "repair_operator": rn,
             })
@@ -547,6 +584,8 @@ class ALNSSolver:
             "paths": self.best.paths,
             "runtime_ms": int((time.time() - start) * 1000),
             "iterations": self.iteration,
+            "invalid_candidates": self.invalid_candidates,
+            "route_validation": validate_routes(self.best.paths, self.best.unassigned, self.instance),
             "weights": self.weights,
             "operator_weights": self.weights,
             "operator_results": self.results,

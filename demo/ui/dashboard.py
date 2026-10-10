@@ -402,6 +402,14 @@ def render_dashboard():
 
     if result:
         st.caption(f"当前结果：{_safe_get(result, 'instance_name', _safe_get(result, 'instance_id', '未知实例'))} | 运行编号：{_safe_get(result, 'run_id', '历史结果')}")
+        if inst:
+            from solver.model import validate_routes
+            validation = validate_routes(result.get("paths"), result.get("unassigned"), inst)
+            if not validation["passed"]:
+                st.error("当前保存结果未通过路线完整性检查：" + "；".join(validation["errors"]) +
+                         "。图中的目标值来自原记录，不能作为可行方案的成本，请在求解页重新运行。")
+        if result.get("invalid_candidates"):
+            st.info(f"本次拦截 {result['invalid_candidates']} 个不可行候选方案，最终结果只保留通过检查的路线。")
     else:
         st.warning("尚未找到求解结果，请先在“求解”页运行一个实例。")
 

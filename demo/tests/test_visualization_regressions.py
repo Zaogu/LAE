@@ -14,6 +14,9 @@ from ui import dashboard
 
 
 def test_actual_operators_and_best_solution(monkeypatch):
+    # 本测试隔离路线成本，专测算子归因及退火；完整性测试使用真实评估器。
+    monkeypatch.setattr(alns, "evaluate", lambda sol, *a, **kw: {
+        "objective": sol.objective, "feasible": sol.feasible})
     monkeypatch.setattr(alns, "initial_solution", lambda *a: Solution([[0, 1, 0]], [], 100, True))
     calls = {"relocate": 0, "random": 0, "greedy": 0}
     objectives = iter([91, 89])
@@ -36,7 +39,7 @@ def test_actual_operators_and_best_solution(monkeypatch):
 
     rng = random.Random(1)
     monkeypatch.setattr(rng, "random", lambda: 0.0)
-    solver = alns.ALNSSolver({"instance_id": "test"}, rng=rng, max_iter=3, time_budget=60,
+    solver = alns.ALNSSolver({"instance_id": "test", "nodes": [{"id": 0}, {"id": 1}]}, rng=rng, max_iter=3, time_budget=60,
                             destroy_set={"random": destroy, "relocate": relocate},
                             repair_set={"greedy": repair}, use_checkpoint=False)
     monkeypatch.setattr(solver, "_pick", lambda ops: "random" if "random" in ops else "greedy")
@@ -54,6 +57,8 @@ def test_actual_operators_and_best_solution(monkeypatch):
 
 
 def test_failed_attempts_have_zero_improvement(monkeypatch):
+    monkeypatch.setattr(alns, "evaluate", lambda sol, *a, **kw: {
+        "objective": sol.objective, "feasible": sol.feasible})
     monkeypatch.setattr(alns, "initial_solution", lambda *a: Solution([[0, 1, 0]], [], 100, True))
 
     def destroy(sol, *a, **kw):
@@ -64,7 +69,7 @@ def test_failed_attempts_have_zero_improvement(monkeypatch):
         new.objective = 120
         return new
 
-    result = alns.ALNSSolver({"instance_id": "test"}, max_iter=3, time_budget=60,
+    result = alns.ALNSSolver({"instance_id": "test", "nodes": [{"id": 0}, {"id": 1}]}, max_iter=3, time_budget=60,
                             destroy_set={"random": destroy}, repair_set={"greedy": repair},
                             use_checkpoint=False).run()
     assert result["operator_results"]["random"] == pytest.approx(0.3)
