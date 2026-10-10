@@ -48,7 +48,8 @@ elif tab == "求解":
         st.warning("未找到实例 JSON。请先运行：python data/instance.py --force")
     else:
         sel = st.selectbox("选择实例", insts)
-        tb = st.number_input("时间预算 (s)", min_value=5, max_value=300, value=30, step=5)
+        tb = st.number_input("时间预算 (s)", min_value=5, max_value=300, value=30, step=5,
+                             help="路线优化的计算时间。AI 接口等待和结果保存额外耗时，单次迭代完成后才检查限时。")
         seed = st.number_input("随机种子", min_value=0, max_value=99999, value=1, step=1)
         if st.button("运行求解"):
             with st.spinner("ALNS 求解中..."):
@@ -87,10 +88,10 @@ elif tab == "求解":
                 os.makedirs(results_dir, exist_ok=True)
                 result_path = os.path.join(results_dir, f"{run_id}_{out['instance_id']}_s{int(seed)}.json")
                 with open(result_path, "w", encoding="utf-8") as f:
-                    json.dump(_json_safe(out), f, ensure_ascii=False, indent=2)
+                    json.dump(out, f, ensure_ascii=False, indent=2)
                 # 固定指针让 dashboard 在 Streamlit 重跑后仍读取刚才这一次。
                 with open(os.path.join(results_dir, "ui_last_result.json"), "w", encoding="utf-8") as f:
-                    json.dump(_json_safe(out), f, ensure_ascii=False, indent=2)
+                    json.dump(out, f, ensure_ascii=False, indent=2)
                 # 保存一条可追溯的 LLM/求解证据，时间线不再依赖手工生成文件。
                 from verify.evidence import new_record, append_round
                 evidence = new_record(

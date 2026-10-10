@@ -75,6 +75,8 @@ def run_group_a(instance: dict, seed: int, time_budget: float,
         "history": out.get("history", []),
         "operator_results": out.get("operator_results", {}),
         "operator_weights": out.get("operator_weights", {}),
+        "operator_stats": out.get("operator_stats", {}),
+        "initial_objective": out.get("initial_objective"),
     }
 
 
@@ -110,7 +112,9 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                        "paths": out["paths"], "unassigned": out["unassigned"],
                        "history": out.get("history", []),
                        "operator_results": out.get("operator_results", {}),
-                       "operator_weights": out.get("operator_weights", {})})
+                       "operator_weights": out.get("operator_weights", {}),
+                       "operator_stats": out.get("operator_stats", {}),
+                       "initial_objective": out.get("initial_objective")})
         return result
 
     # LLM 可用：生成"完整求解器"（比 C 组更大的自由度，无静态检查）
@@ -133,7 +137,9 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                            "paths": out["paths"], "unassigned": out["unassigned"],
                            "history": out.get("history", []),
                            "operator_results": out.get("operator_results", {}),
-                           "operator_weights": out.get("operator_weights", {})})
+                           "operator_weights": out.get("operator_weights", {}),
+                           "operator_stats": out.get("operator_stats", {}),
+                           "initial_objective": out.get("initial_objective")})
             result["recovery_action"] = "llm_only_ok"
         else:
             result["llm_only_infeasible"] = True
@@ -146,7 +152,12 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                            "feasibility_rate": out["feasibility_rate"],
                            "runtime_ms": out["runtime_ms"],
                            "iterations": out["iterations"],
-                           "paths": out["paths"], "unassigned": out["unassigned"]})
+                           "paths": out["paths"], "unassigned": out["unassigned"],
+                           "history": out.get("history", []),
+                           "operator_results": out.get("operator_results", {}),
+                           "operator_weights": out.get("operator_weights", {}),
+                           "operator_stats": out.get("operator_stats", {}),
+                           "initial_objective": out.get("initial_objective")})
     else:
         result["llm_only_infeasible"] = True
         result["error"] = res["error"]
@@ -160,7 +171,9 @@ def run_group_b(instance: dict, seed: int, time_budget: float,
                        "paths": out["paths"], "unassigned": out["unassigned"],
                        "history": out.get("history", []),
                        "operator_results": out.get("operator_results", {}),
-                       "operator_weights": out.get("operator_weights", {})})
+                       "operator_weights": out.get("operator_weights", {}),
+                       "operator_stats": out.get("operator_stats", {}),
+                       "initial_objective": out.get("initial_objective")})
     return result
 
 
@@ -191,6 +204,8 @@ def run_group_c(instance: dict, seed: int, time_budget: float,
         "history": out.get("history", []),
         "operator_results": out.get("operator_results", {}),
         "operator_weights": out.get("operator_weights", {}),
+        "operator_stats": out.get("operator_stats", {}),
+        "initial_objective": out.get("initial_objective"),
         "recovery_action": loop_res["recovery_action"],
         "llm_code": loop_res.get("generated_code", ""),
         "attempts": loop_res.get("attempts_log", []),
