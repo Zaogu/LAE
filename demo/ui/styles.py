@@ -131,7 +131,7 @@ body, .stApp { font-family: var(--sans); }
 [data-testid="stSidebar"] { position: relative; z-index: 3; }
 
 /* ============ 主内容留白 ============ */
-.block-container { padding-top: 1.9rem; padding-bottom: 3.5rem; max-width: 100%; }
+.block-container { padding-top: 1.9rem; padding-bottom: 5rem; max-width: 100%; }
 @media (min-width: 1100px) { .block-container { padding-left: 2.25rem; padding-right: 2.25rem; } }
 @media (min-width: 1600px) { .block-container { padding-left: 3rem; padding-right: 3rem; } }
 
@@ -316,40 +316,57 @@ header[data-testid="stHeader"] { background: transparent; height: 0; }
 .notice.danger { background: #FBEFEF; border-color: #EDC9C9; color: #9E3030; }
 
 /* ============ 按钮 ============ */
-.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+/* Streamlit 1.35 的标记：data-testid="baseButton-<kind>"，
+   kind ∈ primary / secondary / primaryFormSubmit / secondaryFormSubmit。 */
+[data-testid="stButton"] button,
+[data-testid="stDownloadButton"] button,
+[data-testid="stFormSubmitButton"] button,
+button[data-testid^="baseButton-"] {
   border-radius: 7px; border: 1px solid var(--border-strong);
   background: var(--surface); color: var(--text);
   font-weight: 550; font-size: 13.5px; min-height: 38px;
   transition: background-color .15s ease, border-color .15s ease, color .15s ease;
   box-shadow: var(--shadow);
 }
-.stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {
+[data-testid="stButton"] button:hover,
+[data-testid="stDownloadButton"] button:hover,
+[data-testid="stFormSubmitButton"] button:hover,
+button[data-testid^="baseButton-"]:hover {
   border-color: var(--primary); color: var(--primary-hover); background: #F7F9FF;
 }
-.stButton > button:focus-visible, .stDownloadButton > button:focus-visible,
-.stFormSubmitButton > button:focus-visible {
+[data-testid="stButton"] button:focus-visible,
+[data-testid="stDownloadButton"] button:focus-visible,
+[data-testid="stFormSubmitButton"] button:focus-visible,
+button[data-testid^="baseButton-"]:focus-visible {
   outline: 2px solid var(--primary); outline-offset: 1px;
 }
-.stButton > button:disabled, .stDownloadButton > button:disabled,
-.stFormSubmitButton > button:disabled {
+[data-testid="stButton"] button:disabled,
+[data-testid="stDownloadButton"] button:disabled,
+[data-testid="stFormSubmitButton"] button:disabled {
   opacity: .5; cursor: not-allowed; box-shadow: none;
 }
 /* 主按钮：实心靛蓝 + 白字 */
-.stButton > button[kind="primary"],
-.stButton > button[data-testid="baseButton-primary"],
-.stFormSubmitButton > button[kind="primary"],
-.stFormSubmitButton > button[data-testid="baseButton-primary"] {
-  background: var(--primary); border-color: var(--primary); color: #FFFFFF;
-  box-shadow: 0 1px 2px rgba(54,89,217,.22);
+button[data-testid="baseButton-primary"],
+button[data-testid="baseButton-primaryFormSubmit"] {
+  background: var(--primary) !important;
+  border-color: var(--primary) !important;
+  color: #FFFFFF !important;
+  box-shadow: 0 1px 2px rgba(54,89,217,.22) !important;
 }
-.stButton > button[kind="primary"]:hover,
-.stButton > button[data-testid="baseButton-primary"]:hover,
-.stFormSubmitButton > button[kind="primary"]:hover,
-.stFormSubmitButton > button[data-testid="baseButton-primary"]:hover {
-  background: var(--primary-hover); border-color: var(--primary-hover); color: #FFFFFF;
+button[data-testid="baseButton-primary"]:hover,
+button[data-testid="baseButton-primaryFormSubmit"]:hover {
+  background: var(--primary-hover) !important;
+  border-color: var(--primary-hover) !important;
+  color: #FFFFFF !important;
 }
-.stButton > button[kind="primary"] p,
-.stFormSubmitButton > button[kind="primary"] p { color: #FFFFFF; }
+button[data-testid="baseButton-primary"] *,
+button[data-testid="baseButton-primaryFormSubmit"] * {
+  color: #FFFFFF !important;
+}
+button[data-testid="baseButton-primary"]:disabled,
+button[data-testid="baseButton-primaryFormSubmit"]:disabled {
+  background: #A9B8E8 !important; border-color: #A9B8E8 !important; opacity: 1 !important;
+}
 
 /* ============ 输入控件 ============ */
 .stTextInput input, .stNumberInput input, .stTextArea textarea {

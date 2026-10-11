@@ -147,6 +147,7 @@ def _recent_result(last, current_inst_name):
                                                     last.get("recovery_action") or "—")),
     ])
     if last.get("timed_out"):
+        st.write("")
         notice("本次搜索在时间预算附近停止，已保留当前最优解；"
                "AI 接口等待与结果保存不计入搜索预算。")
 
@@ -193,14 +194,12 @@ def render():
         else:
             empty_state("无法读取实例元数据", "所选实例文件无法解析，请检查文件是否完整。")
 
-    st.write("")
-    st.write("")
-    l2, r2 = st.columns([1.1, 1], gap="large")
-    with r2:
+        st.write("")
+        st.write("")
         _recent_result(last, sel)
 
-    st.write("")
     if submitted:
+        st.write("")
         run_state = st.status("正在求解…", expanded=True)
         try:
             inst = _load_instance(sel)
