@@ -73,9 +73,9 @@ html, body { background: var(--bg); }
 .stApp, .stMarkdown, .stMarkdown p, label, .stCaption { color: var(--text); }
 body, .stApp { font-family: var(--sans); }
 
-/* ============ 环境光背景层（缓慢漂移，不拦截输入） ============ */
+/* ============ 环境光背景层（脱离文档流，不改写任何容器定位） ============ */
 .ambient-bg {
-  position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+  position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
   background: var(--bg);
 }
 .ambient-bg .glow {
@@ -125,17 +125,19 @@ body, .stApp { font-family: var(--sans); }
   .ambient-bg .glow { opacity: .65; animation-duration: 60s; }
 }
 
-/* 主内容抬到背景层之上 */
-[data-testid="stAppViewContainer"] { position: relative; z-index: 1; background: transparent; }
+/* 内容背景透明，让 fixed 背景层（z-index:-1）透出；
+   不改写 stAppViewContainer / stSidebar 的 position 与 z-index，
+   以保持 Streamlit 自身滚动容器行为不变。 */
 [data-testid="stMain"] { background: transparent; }
-[data-testid="stSidebar"] { position: relative; z-index: 3; }
 
 /* ============ 主内容留白 ============ */
-.block-container { padding-top: 1.9rem; padding-bottom: 5rem; max-width: 100%; }
+/* 只加内边距，不动高度/溢出，避免影响页面滚动。 */
+.block-container { padding-top: 1.9rem; padding-bottom: 4rem; max-width: 100%; }
 @media (min-width: 1100px) { .block-container { padding-left: 2.25rem; padding-right: 2.25rem; } }
 @media (min-width: 1600px) { .block-container { padding-left: 3rem; padding-right: 3rem; } }
 
-header[data-testid="stHeader"] { background: transparent; height: 0; }
+/* 顶部栏：只做透明化，不改高度（改 height:0 会破坏 Streamlit 滚动容器的高度计算）。 */
+header[data-testid="stHeader"] { background: transparent; }
 [data-testid="stToolbar"] { display: none; }
 [data-testid="stDecoration"] { display: none; }
 
