@@ -23,6 +23,7 @@ import random
 import time
 import inspect
 from contextvars import ContextVar
+from collections import OrderedDict
 
 from solver.model import Solution, load_params, truck_energy, drone_energy, drone_feasible, validate_routes
 import numpy as np
@@ -280,8 +281,8 @@ def _path_cost_fast(ctx, params, path):
 # 因此对一条固定 path，可一次性预计算出：
 #   base[k]  —— 第 k 段的载荷无关基础代价（不含 load_factor）
 # 之后任意候选插入位的代价都能由这些后缀和 O(1) 组合得到。
-_INC_CACHE = {}
-_INC_CACHE_MAX = 8
+_INC_CACHE = OrderedDict()
+_INC_CACHE_MAX = 32
 
 
 def _seg_base(ctx, params, i, j):
@@ -310,50 +311,44 @@ def _seg_base(ctx, params, i, j):
 
 
 def _path_index(path, ctx, params):
-    """按“路径内容”缓存各段基础代价，避免同一次 repair 重复重建。
-
-    返回 bases，bases[k] = base(path[k], path[k+1])。
-    缓存键用 (长度, 首尾节点) + 段序号校验；即使键碰撞，
-    下方 bases 也会在长度不符时重建。仅作为单次 repair 内的局部加速，
-    真正的重复开销已由 _seg_base 的节点对缓存消除。
-    """
-    key = (len(path), path[0], path[-1])
-    hit = _INC_CACHE.get(key)
-    if hit is not None and hit[1] == path[:8]:
-        return hit[0]
-    bases = [_seg_base(ctx, params, path[k], path[k + 1])
-             for k in range(len(path) - 1)]
-    # 同时缓存前缀和（Σbase、Σk*base），使候选评估真正 O(1)：
-    # 否则每个候选都要重新遍历 pos 前缀，2000 节点下仍为秒级。
-    pre_sb = [0.0] * (len(bases) + 1)
-    pre_skb = [0.0] * (len(bases) + 1)
-    for k, b in enumerate(bases):
-        pre_sb[k + 1] = pre_sb[k] + b
-        pre_skb[k + 1] = pre_skb[k] + k * b
-    if len(_INC_CACHE) >= _INC_CACHE_MAX:
-        _INC_CACHE.clear()
-    _INC_CACHE[key] = (bases, path[:8], pre_sb, pre_skb)
-    return bases
+    return _path_prefix(path, ctx, params)[0]
 
 
 def _path_prefix(path, ctx, params):
-    """返回 (bases, pre_sb, pre_skb)：段基础代价及其前缀和缓存。"""
-    _path_index(path, ctx, params)          # 填充/命中缓存
-    key = (len(path), path[0], path[-1])
-    entry = _INC_CACHE.get(key)
-    if entry is not None and entry[1] == path[:8]:
-        return entry[0], entry[2], entry[3]
-    # 缓存被清空或碰撞时回退为直接计算
+    """Cache by full route and retained evaluation context, never just its prefix."""
+    key = (id(ctx), tuple(path))
+    hit = _INC_CACHE.get(key)
+    if hit is not None:
+        _INC_CACHE.move_to_end(key)
+        return hit
     bases = [_seg_base(ctx, params, path[k], path[k + 1])
              for k in range(len(path) - 1)]
-    pre_sb = [0.0] * (len(bases) + 1)
-    pre_skb = [0.0] * (len(bases) + 1)
+    pre_sb, pre_skb = [0.0], [0.0]
     for k, b in enumerate(bases):
-        pre_sb[k + 1] = pre_sb[k] + b
-        pre_skb[k + 1] = pre_skb[k] + k * b
-    _INC_CACHE[key] = (bases, path[:8], pre_sb, pre_skb)
-    return bases, pre_sb, pre_skb
+        pre_sb.append(pre_sb[-1] + b)
+        pre_skb.append(pre_skb[-1] + k * b)
+    hit = (bases, pre_sb, pre_skb)
+    _INC_CACHE[key] = hit
+    if len(_INC_CACHE) > _INC_CACHE_MAX:
+        _INC_CACHE.popitem(last=False)
+    return hit
 
+
+def _remember_positions(partial, original, removed):
+    """Keep surviving neighbours of removed customers for safe reinsertion."""
+    removed_set = set(removed)
+    anchors = {}
+    for pi, path in enumerate(original.paths):
+        for pos, customer in enumerate(path):
+            if customer not in removed_set or customer == 0:
+                continue
+            left, right = pos - 1, pos + 1
+            while left > 0 and path[left] in removed_set:
+                left -= 1
+            while right < len(path) - 1 and path[right] in removed_set:
+                right += 1
+            anchors[customer] = (pi, path[left], path[right])
+    partial._insertion_anchors = anchors
 
 
 # ---- 预置破坏算子（FR-4）----------------------------------------
@@ -389,37 +384,39 @@ def _auto_k(sol, kw, frac=0.0, lo=2, hi=8):
 
 def destroy_random(sol, instance, rng, k=None, **kw):
     check_deadline()
-    k = _auto_k(sol, kw)
+    k = _auto_k(sol, dict(kw, k=k))
     served = [i for p in sol.paths for i in p if i != 0]
     removed = rng.sample(served, min(k, len(served)))
     partial = sol.copy()
     partial.paths = [list(_drop(p, removed)) for p in partial.paths]
     partial.paths = [p for p in partial.paths if len(p) > 1]
     partial.unassigned = list(partial.unassigned) + removed
+    _remember_positions(partial, sol, removed)
     return removed, partial
 
 
 def destroy_worst(sol, instance, rng, k=None, **kw):
     params = kw.get("params") or load_params()
-    k = _auto_k(sol, kw)
+    k = _auto_k(sol, dict(kw, k=k))
     served = list({i for p in sol.paths for i in p if i != 0})
     max_candidates = int(kw.get("max_worst_candidates", 128))
     if len(served) > max_candidates:
         served = rng.sample(served, max_candidates)
     check_deadline()
     served = sorted(served,
-                    key=lambda i: -_remove_cost(sol, instance, params, i))
+                    key=lambda i: _remove_cost(sol, instance, params, i))
     removed = served[:k]
     partial = sol.copy()
     partial.paths = [list(_drop(p, removed)) for p in partial.paths]
     partial.paths = [p for p in partial.paths if len(p) > 1]
     partial.unassigned = list(partial.unassigned) + removed
+    _remember_positions(partial, sol, removed)
     return removed, partial
 
 
 def destroy_shaw(sol, instance, rng, k=None, **kw):
     """相关移除：按坐标近邻 + 相同时间窗聚集（原型简化为坐标近邻聚类）。"""
-    k = _auto_k(sol, kw)
+    k = _auto_k(sol, dict(kw, k=k))
     served = [i for p in sol.paths for i in p if i != 0]
     check_deadline()
     if not served:
@@ -434,6 +431,7 @@ def destroy_shaw(sol, instance, rng, k=None, **kw):
     partial.paths = [list(_drop(p, removed)) for p in partial.paths]
     partial.paths = [p for p in partial.paths if len(p) > 1]
     partial.unassigned = list(partial.unassigned) + removed
+    _remember_positions(partial, sol, removed)
     return removed, partial
 
 
@@ -442,69 +440,23 @@ def _drop(path, removed_set):
 
 
 def destroy_relocate(sol, instance, rng, k=None, **kw):
-    """跨路径 relocate：取 k 个客户，重新插入到（同路径或另一路径的）**最优位置**。
-
-    与普通破坏的区别：不丢进 unassigned，而是直接重放到最小增量成本的位置，
-    让 ALNS 能探索“节点在路径间重新分配”的搜索空间，使不同能耗模型
-    （M1/M2/M3）因成本梯度不同而收敛到不同路径结构 → 跨模型 gap 可被观测。
-
-    修复记录（2026-10-11）：原实现把客户插到**随机路径的随机位置**，
-    不做任何成本评估。在 2000 节点（每路径 ~1000 客户）规模下，随机位
-    几乎不可能优于原位，实测 60s 内 relocate 被调用 93 次、改进 0 次，
-    纯粹消耗预算。现改为用 _best_insert_into 选最优插入位（增量代价
-    O(候选数)），并在无法改进时保留原路径。
-
-    返回 (removed, partial)：removed 仅作日志记录（这些节点已被重放）。
-    """
+    """Evaluate reinsertion with original gaps available; keep a non-worse move."""
     params = kw.get("params") or load_params()
     check_deadline()
-    k = _auto_k(sol, kw)
+    k = _auto_k(sol, dict(kw, k=k))
     served = [i for p in sol.paths for i in p if i != 0]
     if not served or len(sol.paths) < 2:
-        # 退化为普通 random（单路径时无法跨路径 relocate）
         return destroy_random(sol, instance, rng, k=k, **kw)
-    k = min(int(k), len(served))
-    moved = rng.sample(served, k)
-    new = sol.copy()
-    rem_set = set(moved)
-    new.paths = [list(_drop(p, rem_set)) for p in new.paths]
-    new.paths = [p for p in new.paths if len(p) > 1]
-
-    max_cands = int(kw.get("max_cands", 64))
-    for c in moved:
-        check_deadline()
-        if not new.paths:
-            new.paths.append([0, 0])
-        # 为每个待放回客户选“插入后目标值最小”的路径与位置。
-        best = None
-        best_obj = None
-        for pi, path in enumerate(new.paths):
-            n = len(path)
-            if n < 2:
-                continue
-            if n <= max_cands + 1:
-                cand_pos = list(range(n - 1))
-            else:
-                cand_pos = [0, n - 2]
-                if rng is not None and n > 3:
-                    cand_pos += rng.sample(range(1, n - 2), min(max_cands - 2, n - 3))
-                cand_pos = sorted(set(cand_pos))
-            for pos in cand_pos:
-                check_deadline()
-                obj_after = _obj_with_insert(new, path, pos, c, instance, params)
-                if best_obj is None or obj_after < best_obj:
-                    best_obj = obj_after
-                    best = (pi, pos)
-        if best is None:
-            new.paths.append([0, c, 0])
-        else:
-            pi, pos = best
-            new.paths[pi].insert(pos + 1, c)
-    ev = evaluate(new, instance, params)
-    new.objective, new.feasible = ev["objective"], ev["feasible"]
-    # 跨路径 relocate 后所有节点仍在 paths，unassigned 不变
-    return list(moved), new
-
+    moved = rng.sample(served, min(k, len(served)))
+    partial = sol.copy()
+    partial.paths = [list(_drop(p, set(moved))) for p in partial.paths]
+    partial.unassigned = list(partial.unassigned) + moved
+    _remember_positions(partial, sol, moved)
+    new = repair_greedy(partial, instance, rng, params=params,
+                        max_cands=int(kw.get("max_cands", 64)))
+    if new.objective > sol.objective:
+        new = sol.copy()
+    return moved, new
 
 
 PREDEFINED_DESTROY = {"random": destroy_random,
@@ -513,13 +465,79 @@ PREDEFINED_DESTROY = {"random": destroy_random,
 
 
 # ---- 修复算子 -----------------------------------------------------
+def _candidate_positions(path, customer, instance, params, rng, max_cands=64, anchor=None):
+    """Original gaps + spatial neighbours + random exploration; legal gaps only."""
+    count = len(path) - 1
+    if count <= 0:
+        return []
+    limit = max(4, int(max_cands))
+    if count <= max(128, limit):
+        return list(range(count))
+    positions = {0, count - 1}
+    index = {node: pos for pos, node in enumerate(path) if node != 0}
+    if anchor is not None:
+        _, predecessor, successor = anchor
+        if predecessor == 0:
+            positions.add(0)
+        elif predecessor in index:
+            positions.add(index[predecessor])
+        if successor == 0:
+            positions.add(count - 1)
+        elif successor in index:
+            positions.add(index[successor] - 1)
+    positions = {pos for pos in positions if 0 <= pos < count}
+    ctx = get_eval_ctx(instance, params)
+    nmap = ctx["nmap"]
+    row = ctx["dist"][nmap[customer]]
+    # Both ends of a gap matter. Evaluate energy afterwards, using the real objective.
+    proximity = np.minimum(row[[nmap[x] for x in path[:-1]]],
+                           row[[nmap[x] for x in path[1:]]])
+    near_count = min(count, max(1, limit * 3 // 4))
+    nearest = np.argpartition(proximity, near_count - 1)[:near_count]
+    for pos in sorted(nearest, key=lambda k: (float(proximity[k]), int(k))):
+        if len(positions) >= limit:
+            break
+        positions.add(int(pos))
+    if rng is not None and len(positions) < limit:
+        available = [pos for pos in range(count) if pos not in positions]
+        positions.update(rng.sample(available, min(limit - len(positions), len(available))))
+    return sorted(positions)
+
+
+def _insertion_options(sol, customer, instance, params, rng=None, max_cands=64):
+    options = []
+    anchor = getattr(sol, "_insertion_anchors", {}).get(customer)
+    for pi, path in enumerate(sol.paths):
+        check_deadline()
+        local_anchor = anchor if anchor is not None and anchor[0] == pi else None
+        positions = _candidate_positions(path, customer, instance, params, rng,
+                                         max_cands, local_anchor)
+        for count, pos in enumerate(positions):
+            if count % 32 == 0:
+                check_deadline()
+            options.append((_obj_with_insert(sol, path, pos, customer, instance, params), pi, pos))
+    return sorted(options)
+
+
+def _insert_selected(sol, customer, option):
+    if option is None:
+        sol.paths.append([0, customer, 0])
+    else:
+        objective, pi, pos = option
+        sol.paths[pi].insert(pos + 1, customer)
+        sol.objective = objective
+    if customer in sol.unassigned:
+        sol.unassigned.remove(customer)
+
+
 def repair_greedy(partial, instance, rng, **kw):
     params = kw.get("params") or load_params()
-    removed = list(partial.unassigned)
-    new = partial.copy(); new.unassigned = []
-    for i in removed:
+    new = partial.copy()
+    new._insertion_anchors = getattr(partial, "_insertion_anchors", {})
+    new.objective = evaluate(new, instance, params)["objective"]
+    for customer in list(new.unassigned):
         check_deadline()
-        _greedy_insert(new, i, instance, params, rng=rng,
+        _greedy_insert(new, customer, instance, params, rng=rng,
                        max_cands=int(kw.get("max_cands", 64)))
     ev = evaluate(new, instance, params)
     new.objective, new.feasible = ev["objective"], ev["feasible"]
@@ -527,29 +545,8 @@ def repair_greedy(partial, instance, rng, **kw):
 
 
 def _greedy_insert(sol, i, instance, params, rng=None, max_cands=64):
-    """贪心插入：每条 path 取 ≤ max_cands 个候选位（端点必含 + 随机采样），避免 O(n²) 全位枚举。"""
-    best = None; bestd = None
-    for pi, path in enumerate(sol.paths):
-        n = len(path)
-        if n < 2:
-            continue
-        if n <= max_cands + 1:
-            cand_pos = list(range(n - 1))
-        else:
-            cand_pos = [0, n - 2]
-            if rng is not None and n > 3:
-                cand_pos += rng.sample(range(1, n - 2), min(max_cands - 2, n - 3))
-            cand_pos = sorted(set(cand_pos))
-        for pos_index, pos in enumerate(cand_pos):
-            if pos_index % 32 == 0:
-                check_deadline()
-            obj_after = _obj_with_insert(sol, path, pos, i, instance, params)
-            if bestd is None or obj_after < bestd:
-                bestd = obj_after; best = (pi, pos)
-    if best is None:
-        sol.paths.append([0, i, 0]); return
-    pi, pos = best
-    sol.paths[pi].insert(pos + 1, i)
+    options = _insertion_options(sol, i, instance, params, rng, max_cands)
+    _insert_selected(sol, i, options[0] if options else None)
 
 
 def _obj_with_insert(sol, path, pos, i, instance, params):
@@ -613,47 +610,34 @@ def _obj_with_insert(sol, path, pos, i, instance, params):
     # 新序号 k+1 => Σ(k+1)*base = Σk*base + Σbase
     new_cost += (sb_tail + (dlt / Q) * (L0_new * sb_tail
                                        - 5.0 * (skb_tail + sb_tail)))
-    new_total = base - old_cost + new_cost - unpen
+    # Account for the changed path duration as well as its energy.
+    end = instance.get("time_windows", {}).get("end", 1e9)
+    phi = params["time_window"].get("phi_per_hour", 0.0)
+    time_delta = phi * (max(0.0, (n + 1) * 2.0 - end) - max(0.0, n * 2.0 - end)) / 60.0
+    penalty_delta = unpen if i in sol.unassigned else 0.0
+    new_total = base - old_cost + new_cost + time_delta - penalty_delta
     return round(new_total, 4)
 
 
 def repair_regret2(partial, instance, rng, **kw):
-    """Regret-2：优先插入"次优-最优插入成本差距最大"的客户（设计文档 3.2）。"""
+    """Regret-2 evaluates and inserts from the same set of candidate positions."""
     params = kw.get("params") or load_params()
-    removed = list(partial.unassigned)
-    new = partial.copy(); new.unassigned = []
-    while removed:
+    new = partial.copy()
+    new._insertion_anchors = getattr(partial, "_insertion_anchors", {})
+    new.objective = evaluate(new, instance, params)["objective"]
+    while new.unassigned:
         check_deadline()
-        regrets = []
-        for i in removed:
-            costs = []
-            for pi, path in enumerate(new.paths):
-                n = len(path)
-                if n < 2:
-                    continue
-                max_cands = int(kw.get("max_cands", 64))
-                if n <= max_cands + 1:
-                    cand = list(range(n - 1))
-                else:
-                    cand = [0, n - 2]
-                    if n > 3:
-                        cand += rng.sample(range(1, n - 2), max_cands - 2)
-                    cand = sorted(set(cand))
-                for pos_index, pos in enumerate(cand):
-                    if pos_index % 32 == 0:
-                        check_deadline()
-                    costs.append(_obj_with_insert(new, path, pos, i, instance, params))
-            if len(costs) >= 2:
-                costs.sort()
-                regrets.append((costs[1] - costs[0], i))
-            elif costs:
-                regrets.append((costs[0], i))
+        ranked = []
+        for customer in new.unassigned:
+            options = _insertion_options(new, customer, instance, params, rng,
+                                         int(kw.get("max_cands", 64)))
+            if options:
+                regret = options[1][0] - options[0][0] if len(options) > 1 else 0.0
+                ranked.append((regret, customer, options[0]))
             else:
-                regrets.append((0.0, i))
-        regrets.sort(reverse=True)
-        i = regrets[0][1]; _greedy_insert(new, i, instance, params, rng=rng,
-                                           max_cands=int(kw.get("max_cands", 64)))
-        removed.remove(i)
+                ranked.append((0.0, customer, None))
+        _, customer, option = max(ranked, key=lambda item: (item[0], item[1]))
+        _insert_selected(new, customer, option)
     ev = evaluate(new, instance, params)
     new.objective, new.feasible = ev["objective"], ev["feasible"]
     return new
@@ -668,7 +652,8 @@ class ALNSSolver:
                  destroy_set=None, repair_set=None,
                  time_budget=60.0, max_iter=10000, checkpoint_interval=100,
                  destroy_fn=None, repair_fn=None, use_checkpoint=True,
-                 time_safety_margin=0.5, max_custom_removed=8):
+                 time_safety_margin=0.5, max_custom_removed=8,
+                 initial_temperature_ratio=0.005, stagnation_limit=100):
         self.instance = instance
         self.params = params or load_params()
         self.rng = rng or random.Random(seed)
@@ -677,6 +662,10 @@ class ALNSSolver:
         self.time_safety_margin = max(0.0, float(time_safety_margin))
         self.max_custom_removed = max(1, int(max_custom_removed))
         self.max_iter = max_iter
+        self.initial_temperature_ratio = max(0.0, float(initial_temperature_ratio))
+        self.stagnation_limit = max(0, int(stagnation_limit))
+        self.stagnation = 0
+        self.restarts = 0
         self.k = checkpoint_interval
         self.use_checkpoint = use_checkpoint
         self.destroy_set = destroy_set or dict(PREDEFINED_DESTROY)
@@ -703,7 +692,24 @@ class ALNSSolver:
         self.startup_ms = 0
         self.budget_overrun_ms = 0
         self._checkpoints = []
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        if self.use_checkpoint:
+            os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+    def _temperature(self, start, deadline):
+        """Exponential cooling controlled by both time and completed iterations."""
+        by_time = (time.perf_counter() - start) / max(deadline - start, 1e-9)
+        by_iteration = self.iteration / max(self.max_iter, 1)
+        progress = min(1.0, max(0.0, by_time, by_iteration))
+        scale = max(abs(self.initial_objective), 1.0)
+        return scale * self.initial_temperature_ratio * (0.01 ** progress)
+
+    def _accept_candidate(self, objective, temperature):
+        delta = objective - self.current.objective
+        if delta <= 0.0:
+            return True
+        if temperature <= 0.0:
+            return False
+        return self.rng.random() < math.exp(-delta / temperature)
 
     def _pick(self, dset):
         names = list(dset.keys())
@@ -828,6 +834,7 @@ class ALNSSolver:
                             partial = candidate.copy()
                             partial.paths = [list(_drop(p, set(chosen))) for p in partial.paths]
                             partial.unassigned = list(candidate.unassigned) + chosen
+                            _remember_positions(partial, candidate, chosen)
                         validation = validate_routes(
                             getattr(partial, "paths", None),
                             getattr(partial, "unassigned", None),
@@ -904,14 +911,22 @@ class ALNSSolver:
                 old_best = self.best.objective
                 improved = candidate_feasible and candidate_objective < old_best
                 accepted = False
+                temperature = self._temperature(start, deadline)
                 if improved:
                     self.current = new
                     self.best = new.copy()
+                    self.stagnation = 0
                     accepted = True
-                elif candidate_feasible and (candidate_objective <= self.current.objective or (
-                        candidate_objective <= self.current.objective * 1.02 and self.rng.random() < 0.3)):
-                    self.current = new
-                    accepted = True
+                else:
+                    self.stagnation += 1
+                    if candidate_feasible and self._accept_candidate(candidate_objective, temperature):
+                        self.current = new
+                        accepted = True
+                restarted = bool(self.stagnation_limit and self.stagnation >= self.stagnation_limit)
+                if restarted:
+                    self.current = self.best.copy()
+                    self.stagnation = 0
+                    self.restarts += 1
                 gain = max(0.0, float(old_best - self.best.objective))
                 for name in {dn, rn} - {None}:
                     self.results[name] += 2.0 if improved else 0.1
@@ -928,6 +943,8 @@ class ALNSSolver:
                     "current_objective": float(self.current.objective),
                     "elapsed_ms": int((time.perf_counter() - start) * 1000),
                     "accepted": accepted,
+                    "temperature": temperature,
+                    "restarted": restarted,
                     "feasible": candidate_feasible,
                     "validation_errors": ev.get("validation_errors", []),
                     "destroy_operator": dn,
@@ -950,6 +967,8 @@ class ALNSSolver:
             "instance_id": self.instance.get("instance_id"),
             "objective_value": self.best.objective,
             "initial_objective": self.initial_objective,
+            "search_restarts": self.restarts,
+            "search_version": "2026-10-11-neighbourhood-v2",
             "feasibility_rate": 1.0 if self.best.feasible else 0.0,
             "unassigned": self.best.unassigned,
             "paths": self.best.paths,

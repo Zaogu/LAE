@@ -24,10 +24,14 @@ from ui.components import sidebar_brand, page_head
 
 PAGES = ["求解", "结果分析", "模型配置"]
 
-st.set_page_config(page_title="SDVRPD 路径优化工作台", page_icon="🛩", layout="wide")
+st.set_page_config(page_title="SDVRPD 路径优化工作台", page_icon="◈", layout="wide")
 inject()
 ambient_layer()
 sidebar_brand()
+
+requested = st.session_state.pop("requested_nav", None)
+if requested in PAGES:
+    st.session_state["nav_page"] = requested
 
 nav = st.sidebar.radio("导航", PAGES, label_visibility="collapsed", key="nav_page")
 

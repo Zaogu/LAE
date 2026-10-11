@@ -87,7 +87,8 @@ def metric_row(items: list) -> None:
             f'<div class="m{" lead" if lead else ""}"><div class="label">{_esc(label)}</div>'
             f'<div class="value {state}">{vtxt}{unit_html}</div></div>'
         )
-    st.markdown(f'<div class="metric-row">{"".join(cells)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="metric-row count-{len(cells)}" style="--metric-columns:{len(cells)}">'
+                f'{"".join(cells)}</div>', unsafe_allow_html=True)
 
 
 def notice(text: str, kind: str = "") -> None:

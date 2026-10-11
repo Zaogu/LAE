@@ -20,9 +20,9 @@ _GRID = "#EDF1F8"
 def _base_layout(fig, title: str, height: int = 460, showlegend: bool = True):
     fig.update_layout(
         template="plotly_white",
-        title=dict(text=title, font=dict(size=15, color=TEXT, family=_FONT), x=0, xanchor="left"),
+        title=dict(text=title, font=dict(size=15, color=TEXT, family=_FONT), x=0, xanchor="left", y=0.98, yanchor="top"),
         height=height,
-        margin=dict(l=64, r=24, t=64, b=48),
+        margin=dict(l=64, r=24, t=88, b=48),
         font=dict(family=_FONT, size=12, color=TEXT_MUTED),
         paper_bgcolor="#FFFFFF",
         plot_bgcolor="#FFFFFF",
@@ -95,7 +95,7 @@ def path_map_2d(result: dict, inst: dict | None, height: int = 460):
         fig.add_trace(go.Scatter(
             x=pxs, y=pys, mode="lines+markers", name=f"路径 {i + 1}",
             line=dict(color=color, width=1.8),
-            marker=dict(size=5.5, color=color, line=dict(width=1, color="#FFFFFF")),
+            marker=dict(size=3, color=color, opacity=0.75, line=dict(width=0)),
             text=ptext, hovertemplate="%{text}<extra>路径 " + str(i + 1) + "</extra>",
         ))
 
@@ -182,7 +182,7 @@ def path_map_3d(result: dict, inst: dict | None, height: int = 560):
     return fig
 
 
-def convergence(history: list, height: int = 420, flat_note: bool = False):
+def convergence(history: list, height: int = 420, flat_note: bool = False, show_candidates: bool = False):
     """收敛曲线：历史最优为主线，候选方案为次级（默认隐藏）。"""
     import plotly.graph_objects as go
 
@@ -203,11 +203,21 @@ def convergence(history: list, height: int = 420, flat_note: bool = False):
                 x=[c[0] for c in cand], y=[c[1] for c in cand],
                 mode="markers", name="候选方案目标值",
                 marker=dict(size=4, color="#C2CBD9"),
-                visible="legendonly",
+                visible=True if show_candidates else "legendonly",
                 hovertemplate="迭代 %{x}<br>候选目标值 %{y:,.4f}<extra></extra>",
             ))
+        current = [(h.get("iteration"), h.get("current_objective"))
+                   for h in hist if h.get("current_objective") is not None]
+        if current:
+            fig.add_trace(go.Scatter(
+                x=[v[0] for v in current], y=[v[1] for v in current],
+                mode="lines", name="当前解目标值",
+                line=dict(color="#74869C", width=1, dash="dot"),
+                visible=True if show_candidates else "legendonly",
+                hovertemplate="迭代 %{x}<br>当前解 %{y:,.4f}<extra></extra>",
+            ))
         vals = [v for v in best if v is not None]
-        if vals and len(set(vals)) == 1:
+        if vals and len(set(vals)) == 1 and not cand and not current:
             margin = max(abs(float(vals[0])) * 0.002, 1.0)
             fig.update_yaxes(range=[vals[0] - margin, vals[0] + margin])
     else:

@@ -4,6 +4,7 @@
 （enabled / provider / base_url / api_key / model / temperature / max_tokens / timeout）。
 """
 from __future__ import annotations
+import html
 import json
 import os
 
@@ -25,9 +26,6 @@ DEFAULTS = {
     "max_tokens": 1500,
     "timeout": 60,
 }
-
-FORM_WIDTH = "820px"
-
 
 def load_config() -> dict:
     if os.path.exists(CONFIG_PATH):
@@ -75,17 +73,18 @@ def test_connection(cfg: dict, timeout: int = 10) -> dict:
 def render():
     cfg = load_config()
     enabled = bool(cfg.get("enabled")) and bool(cfg.get("api_key"))
+    if st.session_state.pop("config_saved", False):
+        st.success("配置已保存。" + ("模型服务已启用。" if enabled
+                                   else "未填写 API Key，求解器将使用预置算子。"))
 
     # ---- 紧凑摘要 ----
     badge = (status_badge("ok", "已启用") if enabled
              else status_badge("idle", "未启用"))
     st.markdown(
-        f'<div style="display:flex;align-items:center;justify-content:space-between;'
-        f'gap:16px;margin-bottom:12px;">'
-        f'<div><div style="font-size:15px;font-weight:600;color:#182235;">{cfg.get("model") or "未设置模型"}</div>'
-        f'<div style="font-size:12.5px;color:#69778A;margin-top:3px;">'
-        f'{cfg.get("provider") or "—"}　·　{cfg.get("base_url") or "—"}</div></div>'
-        f'<div style="flex:0 0 auto;">{badge}</div></div>',
+        '<div class="service-summary"><div>'
+        f'<div class="name">{html.escape(str(cfg.get("model") or "未设置模型"))}</div>'
+        f'<div class="detail">{html.escape(str(cfg.get("provider") or "—"))}'
+        f' · {html.escape(str(cfg.get("base_url") or "—"))}</div></div>{badge}</div>',
         unsafe_allow_html=True)
     if not enabled:
         st.caption("未启用模型服务时，求解器使用预置破坏算子，不调用外部接口。")
@@ -96,7 +95,6 @@ def render():
     st.write("")
     section_title("设置")
 
-    st.markdown(f'<div style="max-width:{FORM_WIDTH};">', unsafe_allow_html=True)
     with st.form("llm_config_form"):
         c1, c2 = st.columns(2)
         with c1:
@@ -107,7 +105,7 @@ def render():
         base_url = st.text_input("API 地址", value=cfg.get("base_url", ""),
                                  help="OpenAI 兼容的 /v1 根地址。")
         api_key = st.text_input("API Key", value=cfg.get("api_key", ""), type="password",
-                                help="以密文保存到 config/llm_config.json，界面不回显明文。")
+                                help="界面默认隐藏 API Key；留空保存时不启用模型服务。")
 
         with st.expander("高级设置", expanded=False):
             d1, d2, d3 = st.columns(3)
@@ -124,7 +122,6 @@ def render():
         c1, c2, _ = st.columns([1, 1, 3])
         submitted = c1.form_submit_button("保存配置", type="primary", use_container_width=True)
         test_clicked = c2.form_submit_button("测试连接", use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
 
     if submitted:
         new_cfg = {
@@ -134,8 +131,8 @@ def render():
         }
         try:
             save_config(new_cfg)
-            st.success("配置已保存。" + ("模型服务已启用。" if new_cfg["enabled"]
-                                        else "未填写 API Key，求解器将使用预置算子。"))
+            st.session_state["config_saved"] = True
+            st.rerun()
         except Exception as e:
             st.error(f"保存失败：{type(e).__name__}: {e}")
             st.caption("输入内容已保留，修正后可再次保存。")

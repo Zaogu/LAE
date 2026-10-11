@@ -11,6 +11,7 @@
 数值与单位沿用求解器输出，不擅自换算；内部编号收进“开发详情”。
 """
 from __future__ import annotations
+import html
 import glob
 import json
 import os
@@ -69,7 +70,7 @@ def render():
         return
 
     inst_id = result.get("instance_id")
-    inst = S.load_instance(inst_id) or S.load_default_instance()
+    inst = S.load_instance(inst_id)
     run_id = result.get("run_id")
     state, label = _fmt_status(result)
     ev = S.load_evidence(run_id)
@@ -78,16 +79,11 @@ def render():
 
     # ---- 标题信息区 ----
     st.markdown(
-        f'<div style="display:flex;align-items:flex-start;justify-content:space-between;'
-        f'gap:20px;margin-bottom:16px;">'
-        f'<div>'
-        f'<div style="font-size:15px;font-weight:600;color:#182235;line-height:1.4;">{inst_name}</div>'
-        f'<div style="font-size:12.5px;color:#69778A;margin-top:4px;line-height:1.6;">'
-        f'运行时间 {_fmt_ts(ts) or "—"}'
-        f'　·　运行编号 <span style="font-family:Consolas,monospace;">{run_id or "—"}</span>'
-        f'</div></div>'
-        f'<div style="flex:0 0 auto;padding-top:2px;">{status_badge(state, label)}</div>'
-        f'</div>', unsafe_allow_html=True)
+        '<div class="run-context"><div>'
+        f'<div class="name">{html.escape(str(inst_name))}</div>'
+        f'<div class="detail">运行时间 {html.escape(str(_fmt_ts(ts) or "—"))}<br>'
+        f'运行编号 <span class="mono">{html.escape(str(run_id or "—"))}</span>'
+        f'</div></div>{status_badge(state, label)}</div>', unsafe_allow_html=True)
 
     obj = result.get("objective_value")
     init = result.get("initial_objective")
@@ -159,11 +155,21 @@ def render():
         history = result.get("history") or []
         values = [h["objective"] for h in history if h.get("objective") is not None]
         flat = bool(values) and len(set(values)) == 1
-        st.plotly_chart(charts.convergence(history), use_container_width=True,
+        show_candidates = st.checkbox("显示当前解与候选方案", value=True, key="show_search_candidates")
+        st.plotly_chart(charts.convergence(history, show_candidates=show_candidates), use_container_width=True,
                         config={"displaylogo": False})
         if flat:
             st.caption(f"本次完成 {result.get('iterations', 0)} 次迭代，未找到更优解，"
-                       "历史最优曲线保持平直。可点击图例中的“候选方案目标值”查看尝试过的方案。")
+                       "历史最优曲线保持平直；当前解与候选方案反映真实搜索尝试。")
+        if history:
+            candidates = [h["candidate_objective"] for h in history
+                          if h.get("candidate_objective") is not None]
+            accepted = sum(bool(h.get("accepted")) for h in history)
+            restarts = result.get("search_restarts")
+            caption = f"已记录 {len(candidates)} 个候选方案，{len(set(candidates))} 个不同目标值，接受 {accepted} 次。"
+            if restarts is not None:
+                caption += f"停滞后回到最优解 {restarts} 次。"
+            st.caption(caption)
         st.write("")
         section_title("算子表现")
         st.plotly_chart(charts.operator_bars(result), use_container_width=True,

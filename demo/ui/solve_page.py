@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 import glob
+import html
 import json
 import os
 
@@ -36,13 +37,17 @@ def _load_instance(name):
         return None
 
 
-def _run_solve(inst, tb, seed):
+def _run_solve(inst, tb, seed, on_phase=None):
     from solver.alns import ALNSSolver
     from solver.model import load_params
     from llm.closed_loop import run_llm_loop
 
     params = load_params()
+    if on_phase:
+        on_phase("生成与校验模型算子")
     llm_res = run_llm_loop(inst, current_objective=0.0, current_unassigned=[], round_no=1)
+    if on_phase:
+        on_phase("搜索路线方案")
     solver = ALNSSolver(
         inst, params=params, seed=int(seed), time_budget=float(tb),
         destroy_fn=llm_res["destroy_fn"] if llm_res.get("recovery_action") == "llm_ok" else None,
@@ -130,8 +135,8 @@ def _recent_result(last, current_inst_name):
         f'{status_badge(state, label)}</div>', unsafe_allow_html=True)
     st.markdown(
         f'<div style="font-size:12.5px;color:#69778A;margin:-4px 0 10px 0;line-height:1.55;">'
-        f'来自运行 <span style="color:#3659D9;">{last.get("run_id", "—")}</span>，'
-        f'实例 <span style="color:#182235;">{res_inst}</span></div>',
+        f'来自运行 <span style="color:#3659D9;">{html.escape(str(last.get("run_id", "—")))}</span>，'
+        f'实例 <span style="color:#182235;">{html.escape(str(res_inst))}</span></div>',
         unsafe_allow_html=True)
     if stale:
         notice(f"该结果来自实例 {res_inst}，与当前选中的 {current_inst_name} 不同，"
@@ -152,6 +157,15 @@ def _recent_result(last, current_inst_name):
                "AI 接口等待与结果保存不计入搜索预算。")
 
 
+def _open_results():
+    st.session_state["requested_nav"] = "结果分析"
+
+
+def _begin_solve():
+    st.session_state["solve_busy"] = True
+    st.session_state.pop("solve_error", None)
+
+
 def render():
     insts = _list_instances()
     if not insts:
@@ -160,7 +174,7 @@ def render():
         return
 
     last = S.load_last_result()
-    left, right = st.columns([1.1, 1], gap="large")
+    left, right = st.columns([1, 1.15], gap="large")
 
     with left:
         section_title("求解参数")
@@ -177,8 +191,10 @@ def render():
             with st.expander("高级参数", expanded=False):
                 seed = st.number_input("随机种子", min_value=0, max_value=99999,
                                        value=1, step=1,
-                                       help="相同种子与相同预算下，求解过程可复现。")
-            submitted = st.form_submit_button("开始求解", type="primary")
+                                       help="固定种子控制随机选择；实际完成的迭代数量仍受时间预算影响。")
+            submitted = st.form_submit_button(
+                "开始求解", type="primary", on_click=_begin_solve,
+                disabled=st.session_state.get("solve_busy", False))
 
     with right:
         section_title("实例摘要")
@@ -198,6 +214,10 @@ def render():
         st.write("")
         _recent_result(last, sel)
 
+    if st.session_state.get("solve_error"):
+        st.error("求解失败：" + st.session_state["solve_error"])
+        st.caption("参数已保留，修正后可再次点击“开始求解”重试。")
+
     if submitted:
         st.write("")
         run_state = st.status("正在求解…", expanded=True)
@@ -205,10 +225,11 @@ def render():
             inst = _load_instance(sel)
             if inst is None:
                 raise ValueError("实例文件无法解析")
-            with run_state:
-                st.write("· 生成 / 校验 LLM 破坏算子")
-                st.write("· 运行 ALNS 路线搜索")
-            out, llm_res = _run_solve(inst, tb, int(seed))
+            def phase(label):
+                run_state.update(label=label, state="running")
+                with run_state:
+                    st.write(label)
+            out, llm_res = _run_solve(inst, tb, int(seed), on_phase=phase)
             run_id = _persist(out, llm_res, inst, sel, tb, int(seed))
             state, label = _status_of(out)
             run_state.update(label=f"求解结束 · {label}",
@@ -225,6 +246,10 @@ def render():
                 st.error(f"{type(e).__name__}: {e}")
                 st.caption("参数已保留，修正后可再次点击“开始求解”重试。")
             st.session_state["after_solve"] = False
+            st.session_state["solve_error"] = f"{type(e).__name__}: {e}"
+        finally:
+            st.session_state["solve_busy"] = False
+        st.rerun()
 
     if st.session_state.get("after_solve"):
         out = S.load_last_result() or {}
@@ -237,9 +262,7 @@ def render():
         st.write("")
         c1, c2, _ = st.columns([1, 1, 3])
         with c1:
-            if st.button("查看结果", type="primary", use_container_width=True):
-                st.session_state["nav_page"] = "结果分析"
-                st.rerun()
+            st.button("查看结果", type="primary", use_container_width=True, on_click=_open_results)
         with c2:
             st.download_button(
                 "导出结果 JSON",
