@@ -128,7 +128,10 @@ def compile_operator(code: str):
     """
     if not code or "def destroy" not in code:
         return None, "empty or missing def destroy"
-    ns = {}
+    # 受控几何查询接口：LLM 算子可直接调用 slope()/distance_m()，
+    # 无需自行实现 haversine 或依赖 instance['arcs']（顺序弧，非邻接表）。
+    from solver.model import Solution, slope, distance_m
+    ns = {"slope": slope, "distance_m": distance_m, "Solution": Solution}
     try:
         compiled = compile(code, "<llm_destroy>", "exec")
         exec(compiled, ns)

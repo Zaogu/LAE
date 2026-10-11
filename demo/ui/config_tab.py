@@ -70,7 +70,6 @@ def test_connection(cfg: dict, timeout: int = 10) -> dict:
 def render_config_tab() -> None:
     """在 Streamlit app 中渲染配置 Tab。"""
     import streamlit as st
-    st.subheader("LLM API 配置")
     st.caption("填写 OpenAI 兼容 API 信息，保存后求解器将调用 LLM 生成破坏算子。"
                "未配置时系统自动降级到预置算子。")
 

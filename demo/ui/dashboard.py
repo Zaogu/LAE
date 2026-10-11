@@ -152,7 +152,12 @@ def _view_path_map(result: dict, inst: dict | None):
                 name=f"Path {pi + 1}",
             ))
 
-    fig.update_layout(title="路径地图（子路径着色）", xaxis_title="Lon (deg)", yaxis_title="Lat (deg)")
+    _apply_dark_theme(fig)
+    fig.update_layout(
+        title=dict(text="路径地图（子路径着色）",
+                   font=dict(color="#90e0ef", size=16)),
+        xaxis_title="Lon (deg)", yaxis_title="Lat (deg)",
+    )
     return fig
 
 
@@ -240,10 +245,16 @@ def _view_convergence(recs: list, result: dict):
     else:
         fig.add_annotation(row=2, col=1, text="当前运行没有算子贡献记录", showarrow=False)
 
+    _apply_dark_theme(fig)
     fig.update_xaxes(title_text="迭代次数", dtick=1 if len(history) <= 20 else None, row=1, col=1)
     fig.update_yaxes(title_text="目标值（越低越好）", tickformat=",.2f", row=1, col=1)
-    fig.update_layout(height=680, title="搜索过程与算子表现", template="plotly_white",
-                      legend=dict(orientation="h", y=1.08), margin=dict(t=100, b=50))
+    fig.update_layout(
+        height=680,
+        title=dict(text="搜索过程与算子表现",
+                   font=dict(color="#90e0ef", size=16)),
+        legend=dict(orientation="h", y=1.08),
+        margin=dict(t=100, b=50),
+    )
     return fig
 
 
@@ -338,11 +349,39 @@ def _view_3d(instance: dict | None, result: dict):
                 line=dict(width=3),
             ))
 
+    _apply_dark_theme(fig, show_grid=False)
     fig.update_layout(
-        title="3D 空域视图（节点高度 + 子路径）",
+        title=dict(text="3D 空域视图（节点高度 + 子路径）",
+                   font=dict(color="#90e0ef", size=16)),
         scene=dict(xaxis_title="Lon", yaxis_title="Lat", zaxis_title="Alt"),
     )
     return fig
+
+
+def _apply_dark_theme(fig, show_grid: bool = True) -> None:
+    """统一深色科研主题：#0d1b2a 底 + 青色系网格/文字，让 plotly 图与 UI 融为一体。"""
+    axis = dict(
+        gridcolor="rgba(72,202,228,0.12)",
+        zerolinecolor="rgba(72,202,228,0.20)",
+        linecolor="rgba(72,202,228,0.30)",
+        color="#cbd5e1",
+        showgrid=show_grid,
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(13,27,42,0.40)",
+        plot_bgcolor="rgba(10,20,32,0.55)",
+        font=dict(color="#cbd5e1", family="Segoe UI, system-ui, sans-serif", size=12),
+        xaxis=axis, yaxis=axis,
+        legend=dict(bgcolor="rgba(13,27,42,0.6)", bordercolor="rgba(72,202,228,0.25)",
+                    borderwidth=1, font=dict(size=12)),
+    )
+    if hasattr(fig, "scene"):
+        sc = fig.layout.scene
+        if sc:
+            sc.xaxis.update(gridcolor="rgba(72,202,228,0.12)", color="#cbd5e1")
+            sc.yaxis.update(gridcolor="rgba(72,202,228,0.12)", color="#cbd5e1")
+            sc.zaxis.update(gridcolor="rgba(72,202,228,0.12)", color="#cbd5e1")
 
 
 def _export_section(st):
@@ -390,8 +429,14 @@ def _export_section(st):
 
 def render_dashboard():
     import streamlit as st
+    from ui.theme import card, kpi_row
 
-    st.subheader("可视化四视图 + 证据导出（T-15）")
+    st.markdown(
+        "<div style='margin:4px 0 14px 0;'>"
+        "<h2 style='color:#48cae4;letter-spacing:1px;font-weight:600;'>\U0001f4ca 可视化四视图 + 证据导出</h2>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
     recs = _load_evidence()
     result = _load_latest_result() or {}
     recs = _filter_evidence_for_result(recs, result)
@@ -399,6 +444,21 @@ def render_dashboard():
     inst = _load_instance(inst_id) if inst_id else None
     if not inst:
         inst = _default_instance()
+
+    # KPI 摘要行（科研指标风格）
+    if result:
+        obj = result.get("objective_value")
+        feas = result.get("feasibility_rate")
+        iters = result.get("iterations", 0)
+        obj_str = f"{obj:,.2f}" if obj is not None else "N/A"
+        feas_str = f"{feas*100:.1f}%" if feas is not None else "N/A"
+        feas_status = "ok" if feas and feas >= 1.0 else "warn"
+        kpi_row([
+            ("目标值", obj_str, "info"),
+            ("可行性", feas_str, feas_status),
+            ("迭代", str(iters), "info"),
+            ("实例", str(_safe_get(result, "instance_name", _safe_get(result, "instance_id", "未知")))[:20], "info"),
+        ])
 
     if result:
         st.caption(f"当前结果：{_safe_get(result, 'instance_name', _safe_get(result, 'instance_id', '未知实例'))} | 运行编号：{_safe_get(result, 'run_id', '历史结果')}")
@@ -416,37 +476,47 @@ def render_dashboard():
     else:
         st.warning("尚未找到求解结果，请先在“求解”页运行一个实例。")
 
-    st.markdown("### 视图 1：路径地图")
-    fig1 = _view_path_map(result, inst)
-    st.plotly_chart(fig1, use_container_width=True)
+    def _view1_body(s):
+        fig1 = _view_path_map(result, inst)
+        s.plotly_chart(fig1, use_container_width=True)
 
-    st.markdown("### 视图 2：收敛曲线 + 算子热力")
-    fig2 = _view_convergence(recs, result)
-    st.plotly_chart(fig2, use_container_width=True)
-    history = result.get("history") or []
-    values = [h["objective"] for h in history if h.get("objective") is not None]
-    if values and len(set(values)) == 1:
-        st.info(f"本次完成 {result.get('iterations', 0)} 次迭代，尚未找到更优解，因此历史最优曲线保持平直。"
-                "可点击图例中的“候选方案目标值”，查看实际尝试过的方案。")
-    if result.get("operator_stats"):
-        st.caption("改进量记录实际执行的算子产生新最优解时的目标值降低量；0 可能表示未调用或未产生改进。"
-                   "破坏和修复算子共同完成的改进分别记录，不能将两者相加作为总改进。")
-    elif result.get("operator_results"):
-        st.caption("这是旧版反馈得分：产生新最优解加 2 分，其他尝试加 0.1 分，并不等于成本降低量。"
-                   "重新运行后会保存准确的算子调用和改进记录。")
+    card("视图 1 · 路径地图（子路径着色）", _view1_body)
 
-    st.markdown("### 视图 3：LLM 生成时间线")
-    _view_llm_timeline(recs)
+    def _view2_body(s):
+        fig2 = _view_convergence(recs, result)
+        s.plotly_chart(fig2, use_container_width=True)
+        history = result.get("history") or []
+        values = [h["objective"] for h in history if h.get("objective") is not None]
+        if values and len(set(values)) == 1:
+            s.info(f"本次完成 {result.get('iterations', 0)} 次迭代，尚未找到更优解，因此历史最优曲线保持平直。"
+                   "可点击图例中的“候选方案目标值”，查看实际尝试过的方案。")
+        if result.get("operator_stats"):
+            s.caption("改进量记录实际执行的算子产生新最优解时的目标值降低量；0 可能表示未调用或未产生改进。"
+                      "破坏和修复算子共同完成的改进分别记录，不能将两者相加作为总改进。")
+        elif result.get("operator_results"):
+            s.caption("这是旧版反馈得分：产生新最优解加 2 分，其他尝试加 0.1 分，并不等于成本降低量。"
+                      "重新运行后会保存准确的算子调用和改进记录。")
 
-    st.markdown("### 视图 4：3D 空域视图")
-    if inst:
-        fig4 = _view_3d(inst, result)
-        if fig4:
-            st.plotly_chart(fig4, use_container_width=True)
+    card("视图 2 · 收敛曲线 + 算子热力", _view2_body)
+
+    def _view3_body(s):
+        _view_llm_timeline(recs)
+
+    card("视图 3 · LLM 生成时间线", _view3_body)
+
+    def _view4_body(s):
+        if inst:
+            fig4 = _view_3d(inst, result)
+            if fig4:
+                s.plotly_chart(fig4, use_container_width=True)
+            else:
+                s.info("3D 视图缺少节点坐标或高度字段。")
         else:
-            st.info("3D 视图缺少节点坐标或高度字段。")
-    else:
-        st.info("无实例数据。")
+            s.info("无实例数据。")
 
-    st.markdown("### 证据导出")
-    _export_section(st)
+    card("视图 4 · 3D 空域视图（节点高度 + 子路径）", _view4_body)
+
+    def _export_body(s):
+        _export_section(s)
+
+    card("证据导出", _export_body)

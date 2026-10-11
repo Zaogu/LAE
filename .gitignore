@@ -14,4 +14,9 @@ demo/data/instances/
 demo/evidence/
 demo/checkpoints/
 demo/experiments/results/
+demo/runs/
 demo/config/llm_config.json
+
+# 虚拟环境（含全部依赖，不应入库）
+.venv/
+venv/

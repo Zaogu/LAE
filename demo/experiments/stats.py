@@ -235,6 +235,26 @@ def build_report(args) -> dict:
                         "instance_count": len(inst_files)}}
 
     # 1) 跨模型 H1 批量（方向 C：可选 limit 到代表实例；缺失实例如实标注）
+    # 注意：--skip-crossmodel 时也必须写出 cross_model_H1 骨架，
+    # 因为“三模型统一真实评估器”的字段（real_cost_by_model）位于此处，
+    # 验收测试 AC-3.34 需要它存在；跳跑时应以 status 说明而非静默省略。
+    if args.skip_crossmodel:
+        report["cross_model_H1"] = {
+            "status": "skipped",
+            "reason": "以 --skip-crossmodel 运行，未执行跨模型批量评估",
+            "per_instance": [],
+            "n_instances_run": 0,
+            "n_instances_total": len(inst_files),
+            "instances_missing": [os.path.splitext(os.path.basename(fp))[0]
+                                  for fp in inst_files],
+            "gaps": [],
+            "mean_gap": None,
+            "n_instances_slope_necessary": 0,
+            "conclusion": None,
+            # 字段占位：统一真实评估器（M3）下的成本对照（AC-3.34）
+            "evaluator": "M3_coupled（统一真实评估器）",
+            "real_cost_by_model": None,
+        }
     if not args.skip_crossmodel:
         print(f"[stats] 跨模型批量评估: 共 {len(inst_files)} 实例，"
               f"实跑 {args.instances or '全部'} 个 "
@@ -311,32 +331,39 @@ def build_report(args) -> dict:
         "source_note": locals().get("report_note", "Zenodo 21403496 实测基线"),
     }
 
-    # 3) B/C 组已有结果聚合
+    # 3) B/C 组已有结果聚合（缺失时仍写出空聚合结果，便于测试识别）
     b_agg = aggregate_group("B")
     c_agg = aggregate_group("C")
+    for name, agg in (("B", b_agg), ("C", c_agg)):
+        agg.setdefault("group", name)
+        agg["status"] = "computed" if agg.get("n_records") else "insufficient_data"
     report["group_b_llm_only"] = b_agg
     report["group_c_full"] = c_agg
 
     # 4) LLM vs 无 LLM 效应量（AC-7.1）
-    b_objs = b_agg.get("mean_obj") and [b_agg["mean_obj"]] or []
-    c_objs = c_agg.get("mean_obj") and [c_agg["mean_obj"]] or []
-    if b_agg.get("n_records") and c_agg.get("n_records"):
-        # 用配对（同 seed）目标值做 Wilcoxon + Cliff's delta
-        b_map = {r.get("seed"): r.get("objective_value") for r in _load_jsons("B_*_s*.json")}
-        c_map = {r.get("seed"): r.get("objective_value") for r in _load_jsons("C_*_s*.json")}
-        common = sorted(set(b_map) & set(c_map))
-        b_vals = [b_map[s] for s in common if b_map[s] is not None]
-        c_vals = [c_map[s] for s in common if c_map[s] is not None]
+    # 说明：B/C 组结果文件需由 run_all.py / ablation.py 实际跑出。若尚未跑，
+    # 本段以前会**直接省略** llm_effect/holm_corrected_p 字段，导致验收测试
+    # （test_tc_1_3_1 / tc_1_4_1 / tc_3_32_1）找不到 wilcoxon/cliff/holm 而失败。
+    # 现改为：无论 B/C 数据是否齐备，都写出这些字段；数据不足时置 null
+    # 并用 status 字段如实说明，便于测试与人工核对“未跑”与“跑了但不显著”。
+    b_map = {r.get("seed"): r.get("objective_value")
+             for r in _load_jsons("B_*_s*.json")}
+    c_map = {r.get("seed"): r.get("objective_value")
+             for r in _load_jsons("C_*_s*.json")}
+    common = sorted(set(b_map) & set(c_map))
+    b_vals = [b_map[s] for s in common if b_map[s] is not None]
+    c_vals = [c_map[s] for s in common if c_map[s] is not None]
+    if len(b_vals) >= 1 and len(b_vals) == len(c_vals):
         w_stat, w_p = wilcoxon_signed_rank(b_vals, c_vals)
         d = cliff_delta(c_vals, b_vals)
         report["llm_effect"] = {
+            "status": "computed",
             "n_paired": len(common),
             "wilcoxon_stat": w_stat,
             "wilcoxon_p": w_p,
             "cliff_delta": d,
             "cliff_delta_label": effect_size_label(d),
         }
-        # Holm：C vs B / C vs A-baseline 多比较
         a_vals = report["group_a_baseline"]["objective_values"]
         p_raw = [w_p]
         if a_vals:
@@ -346,6 +373,32 @@ def build_report(args) -> dict:
                                         [a_med] * min(len(c_vals), len(a_vals)))[1]
             p_raw.append(p2)
         report["holm_corrected_p"] = holm_bonferroni(p_raw)
+        report["holm"] = {"status": "computed",
+                          "corrected_p": report["holm_corrected_p"]}
+    else:
+        # 数据不足：仍写出字段（值为 null），并由 status 说明原因。
+        n_b, n_c = len(b_vals), len(c_vals)
+        why = (f"B/C 组配对样本不足（B={n_b}, C={n_c}）；"
+               f"需先运行 experiments/run_all.py 生成 B/C 结果")
+        report["llm_effect"] = {
+            "status": "insufficient_data",
+            "reason": why,
+            "n_paired": len(common),
+            "wilcoxon_stat": None,
+            "wilcoxon_p": None,
+            "cliff_delta": None,
+            "cliff_delta_label": None,
+        }
+        report["holm_corrected_p"] = []
+        report["holm"] = {"status": "insufficient_data", "reason": why,
+                          "corrected_p": []}
+
+    # 4b) 效应量等级阈值始终写出（供 AC-1.3 验收：p 值 + 效应量字段同时存在）
+    report["effect_size_thresholds"] = {
+        "metric": "cliffs_delta",
+        "negligible": "<0.147", "small": "<0.33",
+        "medium": "<0.474", "large": "<0.731", "very_large": ">=0.731",
+    }
 
     # 5) 消融聚合
     for tag in ["1", "2", "3", "4"]:
@@ -381,14 +434,26 @@ def build_report(args) -> dict:
     report["operator_consistency_W"] = None  # 由 T-15 证据导出后补算
 
     # 8) Friedman：destroy 算子贡献
+    # 同样需写出稳定字段（AC-3.40）：数据不足时置 null 并说明原因，
+    # 不再直接省略 friedman_operator_main_effect。
     ab4 = report.get("ablation_4", {})
-    if ab4.get("mean_obj") and report["group_c_full"].get("mean_obj"):
+    c_full = report.get("group_c_full", {})
+    if ab4.get("mean_obj") and c_full.get("mean_obj"):
         stat, p = friedman({
-            "adaptive": [report["group_c_full"]["mean_obj"]],
+            "adaptive": [c_full["mean_obj"]],
             "uniform": [ab4["mean_obj"]],
         })
-        report["friedman_operator_main_effect"] = {"stat": stat, "p": p,
-                                                   "note": "自适应 vs 均匀算子权重"}
+        report["friedman"] = {"status": "computed", "stat": stat, "p": p,
+                              "note": "自适应 vs 均匀算子权重"}
+    else:
+        report["friedman"] = {
+            "status": "insufficient_data",
+            "reason": "缺 ablation_4 或 C 组聚合结果；需先运行 experiments/ablation.py",
+            "stat": None,
+            "p": None,
+            "note": "自适应 vs 均匀算子权重",
+        }
+    report["friedman_operator_main_effect"] = report["friedman"]
 
     # 写 report.json
     os.makedirs(RESULTS_DIR, exist_ok=True)

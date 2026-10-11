@@ -6,6 +6,7 @@
     "beta": 0.8,
     "gamma": 0.3,
     "delta": 0.5,
+    "truck_capacity_kg": 100.0,
     "truck_speed": 12.0,
     "_comment_drone": "无人机三段能耗：巡航(与水平距离/坡度)、爬升(高度增量)、垂直(起降)。系数无量纲化，最终乘 base_energy_per_km。",
     "drone_base_energy_per_km": 0.6,
@@ -33,5 +34,6 @@
   "network": {
     "_comment": "卡车数量默认值；无人机数按 CSV 机型数自动推断（SPEC 待澄清#3）。",
     "num_trucks": 2
-  }
+  },
+  "truck_count": 2
 }

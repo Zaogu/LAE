@@ -14,6 +14,14 @@ from ui import dashboard
 
 
 def test_actual_operators_and_best_solution(monkeypatch):
+    """算子归因与退火：relocate 由轮盘赌选中（不再被每 3 轮强制）。
+
+    历史变更（2026-10-11）：原实现用 `iteration % 3 == 0` 硬编码强制
+    每第 3 轮执行 relocate 并跳过 repair；实测该规则在 2000 节点实例上
+    调用 93 次、改进 0 次，纯粹消耗预算。relocate 已改为择优插入并
+    参与自适应权重，由收益决定使用频率。本测试改为显式交替选择
+    relocate 与 random，验证两种路径的归因仍然正确。
+    """
     # 本测试隔离路线成本，专测算子归因及退火；完整性测试使用真实评估器。
     monkeypatch.setattr(alns, "evaluate", lambda sol, *a, **kw: {
         "objective": sol.objective, "feasible": sol.feasible})
@@ -42,7 +50,18 @@ def test_actual_operators_and_best_solution(monkeypatch):
     solver = alns.ALNSSolver({"instance_id": "test", "nodes": [{"id": 0}, {"id": 1}, {"id": 2}]}, rng=rng, max_iter=3, time_budget=60,
                             destroy_set={"random": destroy, "relocate": relocate},
                             repair_set={"greedy": repair}, use_checkpoint=False)
-    monkeypatch.setattr(solver, "_pick", lambda ops: "random" if "random" in ops else "greedy")
+    # 显式按轮次交替：第 1 轮 relocate（跳过 repair），第 2/3 轮 random+repair
+    # _pick 每轮调用两次（选破坏算子、选修复算子）。
+    # 第 1 轮选 relocate（返回完整解，不再选修复算子），
+    # 第 2/3 轮选 random 破坏 + greedy 修复，与旧测试语义一致。
+    destroy_picks = iter(["relocate", "random", "random"])
+
+    def _pick(ops):
+        if "relocate" in ops:                     # 正在选破坏算子
+            return next(destroy_picks, "random")
+        return "greedy" if "greedy" in ops else list(ops)[0]
+
+    monkeypatch.setattr(solver, "_pick", _pick)
     result = solver.run()
     assert calls == {"relocate": 1, "random": 2, "greedy": 2}
     assert [h["objective"] for h in result["history"]] == [100, 90, 90, 89]

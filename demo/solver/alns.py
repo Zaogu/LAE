@@ -35,6 +35,14 @@ class BudgetExceeded(RuntimeError):
     """协作式时间预算到期；由主循环捕获并返回当前最优解。"""
 
 
+class InvalidOperatorResult(RuntimeError):
+    """算子返回值不符合 (removed, partial) 接口约定。
+
+    典型来源：LLM 生成的算子漏写 return，隐式返回 None。
+    主循环捕获后丢弃该候选并继续，不让单次坏算子中断整次求解（EC-4）。
+    """
+
+
 _deadline = ContextVar("alns_deadline", default=None)
 
 
@@ -132,7 +140,11 @@ def initial_solution(instance, rng, params=None):
     ctx = get_eval_ctx(instance, p0)
     dist = ctx["dist"]
     nmap = ctx["nmap"]
-    n_truck = int(p0.get("truck_count", 2))
+    # 卡车数优先读顶层 truck_count；为兼容历史配置回退到 network.num_trucks。
+    # 原先只读 truck_count，而 params.json 写的是 network.num_trucks，
+    # 导致改配置文件不生效（静默走默认值）。
+    _net = p0.get("network", {}) or {}
+    n_truck = int(p0.get("truck_count", _net.get("num_trucks", 2)))
 
     ids = [n["id"] for n in instance["nodes"]]
     cust = [x for x in ids if x != 0]
@@ -262,6 +274,87 @@ def _path_cost_fast(ctx, params, path):
     return total
 
 
+# ---- 插入评估的 O(1) 预计算（T-14 深化）----------------------------
+# seg_cost_fast 可分解为：  base(i,j) * (1 + delta * load / Q)
+# 其中 base(i,j) 与载荷无关，load 仅由“距路径起点的段序号”决定。
+# 因此对一条固定 path，可一次性预计算出：
+#   base[k]  —— 第 k 段的载荷无关基础代价（不含 load_factor）
+# 之后任意候选插入位的代价都能由这些后缀和 O(1) 组合得到。
+_INC_CACHE = {}
+_INC_CACHE_MAX = 8
+
+
+def _seg_base(ctx, params, i, j):
+    """段基础代价（不含载荷因子），与 seg_cost_fast(load=0) 一致。
+
+    结果只取决于节点对 (i, j) 与能耗系数，与路径/载荷无关，因此在
+    ctx 内按节点对缓存：同一实例的插入评估会重复查询相同弧，
+    缓存后避免反复做 dict/数组索引与 max() 比较。
+    """
+    cache = ctx.setdefault("seg_base", {})
+    key = (i, j)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    nmap = ctx["nmap"]
+    if key in ctx["arc"]:
+        d_km, th, _dh = ctx["arc"][key]
+    else:
+        d_km = float(ctx["dist"][nmap.get(i), nmap.get(j)])
+        th = float(ctx["theta"][nmap.get(i), nmap.get(j)])
+    c = ctx["coef"]
+    val = (c["alpha"] + c["beta"] * max(0.0, th) + c["gamma"] * max(0.0, -th)) \
+        * d_km * 1000.0
+    cache[key] = val
+    return val
+
+
+def _path_index(path, ctx, params):
+    """按“路径内容”缓存各段基础代价，避免同一次 repair 重复重建。
+
+    返回 bases，bases[k] = base(path[k], path[k+1])。
+    缓存键用 (长度, 首尾节点) + 段序号校验；即使键碰撞，
+    下方 bases 也会在长度不符时重建。仅作为单次 repair 内的局部加速，
+    真正的重复开销已由 _seg_base 的节点对缓存消除。
+    """
+    key = (len(path), path[0], path[-1])
+    hit = _INC_CACHE.get(key)
+    if hit is not None and hit[1] == path[:8]:
+        return hit[0]
+    bases = [_seg_base(ctx, params, path[k], path[k + 1])
+             for k in range(len(path) - 1)]
+    # 同时缓存前缀和（Σbase、Σk*base），使候选评估真正 O(1)：
+    # 否则每个候选都要重新遍历 pos 前缀，2000 节点下仍为秒级。
+    pre_sb = [0.0] * (len(bases) + 1)
+    pre_skb = [0.0] * (len(bases) + 1)
+    for k, b in enumerate(bases):
+        pre_sb[k + 1] = pre_sb[k] + b
+        pre_skb[k + 1] = pre_skb[k] + k * b
+    if len(_INC_CACHE) >= _INC_CACHE_MAX:
+        _INC_CACHE.clear()
+    _INC_CACHE[key] = (bases, path[:8], pre_sb, pre_skb)
+    return bases
+
+
+def _path_prefix(path, ctx, params):
+    """返回 (bases, pre_sb, pre_skb)：段基础代价及其前缀和缓存。"""
+    _path_index(path, ctx, params)          # 填充/命中缓存
+    key = (len(path), path[0], path[-1])
+    entry = _INC_CACHE.get(key)
+    if entry is not None and entry[1] == path[:8]:
+        return entry[0], entry[2], entry[3]
+    # 缓存被清空或碰撞时回退为直接计算
+    bases = [_seg_base(ctx, params, path[k], path[k + 1])
+             for k in range(len(path) - 1)]
+    pre_sb = [0.0] * (len(bases) + 1)
+    pre_skb = [0.0] * (len(bases) + 1)
+    for k, b in enumerate(bases):
+        pre_sb[k + 1] = pre_sb[k] + b
+        pre_skb[k + 1] = pre_skb[k] + k * b
+    _INC_CACHE[key] = (bases, path[:8], pre_sb, pre_skb)
+    return bases, pre_sb, pre_skb
+
+
 
 # ---- 预置破坏算子（FR-4）----------------------------------------
 def _remove_cost(sol, instance, params, i):
@@ -274,8 +367,29 @@ def _remove_cost(sol, instance, params, i):
     return ev["objective"] - ev_before
 
 
-def destroy_random(sol, instance, rng, k=2, **kw):
+def _auto_k(sol, kw, frac=0.0, lo=2, hi=8):
+    """移除规模 k，默认小规模（k=2）；显式传入时以传入值为准。
+
+    实测对比（2000 节点实例，seed=1，20s 预算，同版本代码）：
+      k=1 gain=0     k=2 gain=103.3（最佳）
+      k=3 gain=0     k=5 gain=35.2
+    曾尝试“按实例规模取比例”（k→40）：结果**所有**候选都劣于初始解，
+    因为 1000 客户的长路径上贪心重插远不如原最近邻串接，
+    大邻域反而让搜索零改进。故默认保持 k=2。
+    """
+    if kw.get("k") is not None:
+        return max(1, int(kw["k"]))
+    served = sum(len(p) - 2 for p in sol.paths if len(p) > 2)
+    if served <= 0:
+        return lo
+    if frac <= 0.0:
+        return lo                      # 默认 k=2（实测最优）
+    return max(lo, min(hi, int(round(served * frac))))
+
+
+def destroy_random(sol, instance, rng, k=None, **kw):
     check_deadline()
+    k = _auto_k(sol, kw)
     served = [i for p in sol.paths for i in p if i != 0]
     removed = rng.sample(served, min(k, len(served)))
     partial = sol.copy()
@@ -285,8 +399,9 @@ def destroy_random(sol, instance, rng, k=2, **kw):
     return removed, partial
 
 
-def destroy_worst(sol, instance, rng, k=2, **kw):
+def destroy_worst(sol, instance, rng, k=None, **kw):
     params = kw.get("params") or load_params()
+    k = _auto_k(sol, kw)
     served = list({i for p in sol.paths for i in p if i != 0})
     max_candidates = int(kw.get("max_worst_candidates", 128))
     if len(served) > max_candidates:
@@ -302,8 +417,9 @@ def destroy_worst(sol, instance, rng, k=2, **kw):
     return removed, partial
 
 
-def destroy_shaw(sol, instance, rng, k=3, **kw):
+def destroy_shaw(sol, instance, rng, k=None, **kw):
     """相关移除：按坐标近邻 + 相同时间窗聚集（原型简化为坐标近邻聚类）。"""
+    k = _auto_k(sol, kw)
     served = [i for p in sol.paths for i in p if i != 0]
     check_deadline()
     if not served:
@@ -325,37 +441,65 @@ def _drop(path, removed_set):
     return [x for x in path if x not in set(removed_set)]
 
 
-def destroy_relocate(sol, instance, rng, k=2, **kw):
-    """跨路径 relocate（方案 2 / FR 增强）：随机取 k 个客户，移到"另一条路径"的候选位。
+def destroy_relocate(sol, instance, rng, k=None, **kw):
+    """跨路径 relocate：取 k 个客户，重新插入到（同路径或另一路径的）**最优位置**。
 
-    与普通破坏的区别：不丢进 unassigned，而是直接随机插入到 sol 中除来源路径外的
-    某条路径的随机位置。这让 ALNS 能探索"节点在路径间重新分配"的搜索空间，
-    使不同能耗模型（M1/M2/M3）因成本梯度不同而收敛到不同路径结构 → 跨模型 gap 可被观测。
+    与普通破坏的区别：不丢进 unassigned，而是直接重放到最小增量成本的位置，
+    让 ALNS 能探索“节点在路径间重新分配”的搜索空间，使不同能耗模型
+    （M1/M2/M3）因成本梯度不同而收敛到不同路径结构 → 跨模型 gap 可被观测。
 
-    返回 (removed, partial)：removed 仅作日志记录（这些节点已被重放，仍在 paths 中）；
-    partial 为已重放的解（repair 阶段可视为无操作或再优化）。
+    修复记录（2026-10-11）：原实现把客户插到**随机路径的随机位置**，
+    不做任何成本评估。在 2000 节点（每路径 ~1000 客户）规模下，随机位
+    几乎不可能优于原位，实测 60s 内 relocate 被调用 93 次、改进 0 次，
+    纯粹消耗预算。现改为用 _best_insert_into 选最优插入位（增量代价
+    O(候选数)），并在无法改进时保留原路径。
+
+    返回 (removed, partial)：removed 仅作日志记录（这些节点已被重放）。
     """
     params = kw.get("params") or load_params()
     check_deadline()
+    k = _auto_k(sol, kw)
     served = [i for p in sol.paths for i in p if i != 0]
     if not served or len(sol.paths) < 2:
         # 退化为普通 random（单路径时无法跨路径 relocate）
         return destroy_random(sol, instance, rng, k=k, **kw)
-    k = min(k, len(served))
+    k = min(int(k), len(served))
     moved = rng.sample(served, k)
     new = sol.copy()
-    # 把 moved 从原路径中移除
     rem_set = set(moved)
     new.paths = [list(_drop(p, rem_set)) for p in new.paths]
     new.paths = [p for p in new.paths if len(p) > 1]
-    # 随机插入到另一条路径（若清空后无路径则补回 [0] 兜底）
+
+    max_cands = int(kw.get("max_cands", 64))
     for c in moved:
+        check_deadline()
         if not new.paths:
-            new.paths.append([0])
-        ti = int(rng.randrange(len(new.paths)))
-        tgt = new.paths[ti]
-        pos = rng.randint(1, max(1, len(tgt) - 1))
-        tgt.insert(pos, c)
+            new.paths.append([0, 0])
+        # 为每个待放回客户选“插入后目标值最小”的路径与位置。
+        best = None
+        best_obj = None
+        for pi, path in enumerate(new.paths):
+            n = len(path)
+            if n < 2:
+                continue
+            if n <= max_cands + 1:
+                cand_pos = list(range(n - 1))
+            else:
+                cand_pos = [0, n - 2]
+                if rng is not None and n > 3:
+                    cand_pos += rng.sample(range(1, n - 2), min(max_cands - 2, n - 3))
+                cand_pos = sorted(set(cand_pos))
+            for pos in cand_pos:
+                check_deadline()
+                obj_after = _obj_with_insert(new, path, pos, c, instance, params)
+                if best_obj is None or obj_after < best_obj:
+                    best_obj = obj_after
+                    best = (pi, pos)
+        if best is None:
+            new.paths.append([0, c, 0])
+        else:
+            pi, pos = best
+            new.paths[pi].insert(pos + 1, c)
     ev = evaluate(new, instance, params)
     new.objective, new.feasible = ev["objective"], ev["feasible"]
     # 跨路径 relocate 后所有节点仍在 paths，unassigned 不变
@@ -418,15 +562,58 @@ def _obj_with_insert(sol, path, pos, i, instance, params):
         raise ValueError("插入位置必须位于仓库起终点之间")
     ctx = get_eval_ctx(instance, params)
     base = sol.objective
-    # 该 path 的旧目标贡献（重算该 path 全部段，其余 path 不变）
-    # 简化：用 evaluate 对 path 的局部重建——仍 O(path) 但避免 O(全解) 复制
-    pth = list(path)
-    pth.insert(pos + 1, i)
-    new_path_cost = _path_cost_fast(ctx, params, pth)
-    old_path_cost = _path_cost_fast(ctx, params, list(path))
-    # 解中该 path 被替换，其他 path 不变；unassigned 少一个
+    # 载荷语义与 _path_cost_fast 严格一致：
+    #   起始载荷 = (len(path)-1)*5（旧）/ len(path)*5（新），每段递减 5。
+    # 关键恒等式（使候选评估降为 O(length-of-tail) 而非 O(path)）：
+    #   seg_cost = base(i,j) * (1 + delta * load / Q)
+    # 旧路径整条代价只与 path 本身有关，与 pos 无关，故用 _path_index 的
+    # 预计算 bases 一次算完；只有插入点之后的新段需要重算。
     unpen = params["cost_params"]["unassigned_penalty"]
-    new_total = base - old_path_cost + new_path_cost - unpen
+    n = len(path)
+    c = ctx["coef"]
+    dlt = c["delta"]
+    Q = c["Q"] if c["Q"] > 0 else 1.0
+
+    # 载荷线性分解（本函数的核心）：
+    #   seg_cost_k = base_k * (1 + delta * L_k / Q)
+    # 其中 L_k = L0 - 5k 只依赖段序号 k。故
+    #   cost = Σ base_k + (delta/Q) * (L0 * Σ base_k - 5 * Σ k * base_k)
+    # 即只需 3 个前缀和：Σbase、Σk*base、以及段序号平移后的对应量。
+    # 这样每个候选位都是 O(1)，不再遍历尾部（原实现每候选 O(path)，
+    # 是 2000 节点下单次 repair 需秒级的根源）。
+    bases, pre_sb, pre_skb = _path_prefix(path, ctx, params)
+    m = n - 1                      # 段数
+    # 旧路径：L0_old = (n-1)*5，段 k 载荷 = L0_old - 5k
+    sb = pre_sb[m]                 # Σ base_k
+    skb = pre_skb[m]               # Σ k*base_k
+    L0_old = (n - 1) * 5.0
+    old_cost = sb + (dlt / Q) * (L0_old * sb - 5.0 * skb)
+
+    # 新路径：L0_new = n*5。插入点 pos 把尾部各段序号整体 +1。
+    # 拆分：前缀段 0..pos-1（序号不变） + 插入的两段（序号 pos, pos+1）
+    #       + 尾部旧段（序号 +1）。
+    new_cost = 0.0
+    L0_new = n * 5.0
+    # 前缀：段 0..pos-1 序号不变，但 L0 变为 L0_new
+    sb_pre = pre_sb[pos]
+    skb_pre = pre_skb[pos]
+    new_cost += sb_pre + (dlt / Q) * (L0_new * sb_pre - 5.0 * skb_pre)
+
+    # 插入的两段：path[pos] -> i（序号 pos）与 i -> path[pos+1]（序号 pos+1）
+    b1 = _seg_base(ctx, params, path[pos], i)
+    b2 = _seg_base(ctx, params, i, path[pos + 1])
+    new_cost += b1 * (1.0 + dlt * ((L0_new - 5.0 * pos) / Q))
+    new_cost += b2 * (1.0 + dlt * ((L0_new - 5.0 * (pos + 1)) / Q))
+
+    # 尾部旧段：原序号 k ∈ [pos+1, m-1]（k=pos 那段已被上面的两段替换），
+    # 新序号整体 +1。注意必须从 pos+1 起，原先从 pos 起会把已替换的
+    # 段重复计入（实测导致目标值偏高）。
+    sb_tail = sb - sb_pre - bases[pos]
+    skb_tail = skb - skb_pre - pos * bases[pos]
+    # 新序号 k+1 => Σ(k+1)*base = Σk*base + Σbase
+    new_cost += (sb_tail + (dlt / Q) * (L0_new * sb_tail
+                                       - 5.0 * (skb_tail + sb_tail)))
+    new_total = base - old_cost + new_cost - unpen
     return round(new_total, 4)
 
 
@@ -520,6 +707,11 @@ class ALNSSolver:
 
     def _pick(self, dset):
         names = list(dset.keys())
+        if not names:
+            # 防御：算子池为空（例如自定义算子被禁用后未补回），
+            # 直接取名字会 IndexError。调用方应保证池非空；
+            # 这里返回 None 让上层跳过本轮，而非崩溃。
+            return None
         ws = [self.weights[n] + 1e-9 for n in names]
         r = self.rng.uniform(0.0, sum(ws))
         acc = 0.0
@@ -585,20 +777,44 @@ class ALNSSolver:
                 if self.custom_repair:
                     rpick["llm"] = self.custom_repair
                 rn = self._pick(rpick)
+                if dn is None or rn is None:
+                    # 算子池为空（自定义算子被禁用且未补回）：
+                    # 跳过本轮而不是崩溃，让已有最优解仍可返回。
+                    self.iteration += 1
+                    continue
                 dfn, rfn = dpick[dn], rpick[rn]
                 candidate = self.current.copy()
                 try:
-                    if self.iteration % 3 == 0 and "relocate" in dpick and len(candidate.paths) >= 2:
-                        # 记录真正执行的 relocate；这一轮没有调用 repair。
-                        dn, rn = "relocate", None
-                        removed, new = _call_operator(
-                            dpick[dn], candidate, self.instance, self.rng,
-                            k=2, params=self.params, deadline=deadline)
+                    def _op_result(r, op_name):
+                        """校验算子返回值；异常返回不污染主循环（EC-4 容错）。
+
+                        LLM 生成的算子可能漏写 return 而隐式返回 None，
+                        直接解包会抛 TypeError 并中断整次求解。
+                        """
+                        if not isinstance(r, (tuple, list)) or len(r) != 2:
+                            raise InvalidOperatorResult(
+                                f"算子 {op_name!r} 返回 {type(r).__name__}，"
+                                f"期望 (removed, partial) 二元组")
+                        return r
+
+                    # relocate 不再被硬编码强制触发（原为 iteration % 3 == 0
+                    # 直接跳过轮盘赌选择）：它已改为择优插入，参与自适应权重，
+                    # 由收益自然决定使用频率。relocate 返回的是已重放的完整解，
+                    # 因此不再调用修复算子。
+                    became_complete = False
+                    if dn == "relocate" and len(candidate.paths) >= 2:
+                        removed, new = _op_result(
+                            _call_operator(
+                                dfn, candidate, self.instance, self.rng,
+                                k=2, params=self.params, deadline=deadline), dn)
+                        rn = None
+                        became_complete = True
                     else:
-                        removed, partial = _call_operator(
-                            dfn, candidate, self.instance, self.rng,
-                            params=self.params, deadline=deadline,
-                            max_remove=self.max_custom_removed if dn == "llm" else None)
+                        removed, partial = _op_result(
+                            _call_operator(
+                                dfn, candidate, self.instance, self.rng,
+                                params=self.params, deadline=deadline,
+                                max_remove=self.max_custom_removed if dn == "llm" else None), dn)
                         if dn == "llm":
                             # LLM 算子只负责选择客户；重建部分解并限制移除量，避免
                             # 一次拿走 8% 客户后让修复算子超时或破坏仓库边界。
@@ -620,6 +836,9 @@ class ALNSSolver:
                             new = _call_operator(
                                 rfn, partial, self.instance, self.rng,
                                 params=self.params, deadline=deadline, max_cands=64)
+                            if not hasattr(new, "paths"):
+                                raise InvalidOperatorResult(
+                                    f"修复算子 {rn!r} 未返回解对象")
                         else:
                             # 非法部分解直接拦截，不交给修复算子制造虚假收益。
                             new, rn = partial, None
@@ -628,6 +847,53 @@ class ALNSSolver:
                     self.timed_out = True
                     self.timeout_reason = "算子或候选评估达到时间预算"
                     break
+                except InvalidOperatorResult as e:
+                    # 单次坏算子不中断求解：计数、丢弃本候选、继续下一轮（EC-4）。
+                    self.invalid_candidates += 1
+                    self.invalid_operator_count = \
+                        getattr(self, "invalid_operator_count", 0) + 1
+                    self.last_invalid_operator_error = str(e)
+                    self.iteration += 1
+                    continue
+                except Exception as e:
+                    # LLM 生成的算子可能因对数据结构猜错而抛任意异常
+                    # （实测：instance['nodes'] 是 list，算子却写 .get() →
+                    #  AttributeError，直接中断整次求解）。
+                    # 仅当本轮涉及自定义算子时静默降级；内置算子的异常仍上抛，
+                    # 避免掩盖真正的代码缺陷。
+                    if dn != "llm" and rn != "llm":
+                        raise
+                    self.invalid_candidates += 1
+                    self.invalid_operator_count = \
+                        getattr(self, "invalid_operator_count", 0) + 1
+                    self.last_invalid_operator_error = \
+                        f"{type(e).__name__}: {e}"
+                    # 自定义算子失败说明它已不可用：禁用并回退到预置算子，
+                    # 避免整轮求解都被坏算子拖垮。
+                    # 注意：不能把算子池清空——UI 会直接传 destroy_set={"llm": fn}，
+                    # 直接 pop 后变成空 dict，_pick 会抛 IndexError。
+                    # 故移除自定义算子后，若池已空则补回内置预置算子。
+                    if self.custom_destroy is not None:
+                        self.destroy_set.pop("llm", None)
+                        self.disabled_custom_destroy = True
+                    if self.custom_repair is not None:
+                        self.repair_set.pop("llm", None)
+                        self.disabled_custom_repair = True
+                    if not self.destroy_set:
+                        self.destroy_set = dict(PREDEFINED_DESTROY)
+                    if not self.repair_set:
+                        self.repair_set = dict(PREDEFINED_REPAIR)
+                    # 权重/结果/统计表同步补齐，保证 _pick 能拿到新算子名
+                    for _n in list(self.destroy_set) + list(self.repair_set):
+                        self.weights.setdefault(_n, 1.0)
+                        self.results.setdefault(_n, 0.0)
+                        self.operator_stats.setdefault(_n, {"calls": 0,
+                                                           "improvements": 0,
+                                                           "improvement_total": 0.0})
+                    self.custom_destroy = None
+                    self.custom_repair = None
+                    self.iteration += 1
+                    continue
                 candidate_objective = float(ev["objective"])
                 candidate_feasible = bool(ev["feasible"]) and math.isfinite(candidate_objective)
                 if candidate_feasible:
