@@ -1,14 +1,14 @@
 """ui/results_page.py —— 结果分析页：围绕当前运行组织的工作区。
 
 标签页：路径 / 搜索过程 / 生成记录 / 导出。
-- 顶部：当前实例、运行时间、状态、运行编号（次级、可复制）。
-- 指标行：真实最优目标值、搜索耗时、迭代次数、可行性。
-- 路径：2D / 3D 切换（radio 横向），路径摘要 + 图例。
+- 顶部：实例、运行时间、运行编号、状态组成的标题信息区。
+- 指标条：最优目标值作为视觉重点，其余指标较轻。
+- 路径：2D / 3D 切换，路径图与右侧路径摘要同一分析区、顶部对齐。
 - 搜索过程：收敛曲线 + 算子表现。
 - 生成记录：LLM 生成时间线（紧凑表格 + 按需展开详情）。
 - 导出：可检索的运行记录表格 + 当前运行导出 + 全量导出。
 
-所有数值与单位沿用求解器输出，不擅自换算；内部编号（T-15 / D5）收进开发详情。
+数值与单位沿用求解器输出，不擅自换算；内部编号收进“开发详情”。
 """
 from __future__ import annotations
 import glob
@@ -18,7 +18,7 @@ import os
 import streamlit as st
 
 from ui.components import (section_title, metric_row, status_badge, empty_state,
-                           kv_list, path_legend)
+                           kv_list, path_legend, notice)
 from ui import state as S
 from ui import charts
 
@@ -29,7 +29,7 @@ def _fmt_status(out):
     if not out:
         return ("idle", "未开始")
     if out.get("timed_out"):
-        return ("warn", "已到时间预算而停止")
+        return ("warn", "已到预算而停止")
     return ("ok", "已完成")
 
 
@@ -40,16 +40,11 @@ def _fmt_ts(ts):
 
 
 def _run_rows():
-    """运行记录表格数据。"""
     rows = []
     for r in S.list_results():
         ev = S.load_evidence(r.get("run_id"))
-        state, label = _fmt_status(r)
-        ts = None
-        for e in ev:
-            if e.get("timestamp"):
-                ts = e["timestamp"]
-                break
+        _, label = _fmt_status(r)
+        ts = next((e.get("timestamp") for e in ev if e.get("timestamp")), None)
         if not ts:
             import datetime
             ts = datetime.datetime.fromtimestamp(r.get("_mtime", 0)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -77,64 +72,65 @@ def render():
     inst = S.load_instance(inst_id) or S.load_default_instance()
     run_id = result.get("run_id")
     state, label = _fmt_status(result)
-
-    # ---- 顶部：当前运行 ----
     ev = S.load_evidence(run_id)
     ts = next((e.get("timestamp") for e in ev if e.get("timestamp")), None)
-    head_l, head_r = st.columns([3, 1])
-    with head_l:
-        st.markdown(
-            f'<div style="font-size:14px;color:#626B78;">实例 '
-            f'<span style="color:#20242C;font-weight:600;">'
-            f'{result.get("instance_name") or inst_id or "未知实例"}</span>'
-            f'　·　运行时间 {_fmt_ts(ts) or "—"}</div>',
-            unsafe_allow_html=True,
-        )
-        if run_id:
-            st.markdown(
-                f'<div style="font-size:12px;color:#8A93A0;font-family:Consolas,monospace;'
-                f'margin-top:4px;">运行编号 {run_id}</div>',
-                unsafe_allow_html=True,
-            )
-    with head_r:
-        st.markdown(f'<div style="text-align:right;padding-top:4px;">{status_badge(state, label)}</div>',
-                    unsafe_allow_html=True)
+    inst_name = result.get("instance_name") or inst_id or "未知实例"
 
-    st.write("")
+    # ---- 标题信息区 ----
+    st.markdown(
+        f'<div style="display:flex;align-items:flex-start;justify-content:space-between;'
+        f'gap:20px;margin-bottom:16px;">'
+        f'<div>'
+        f'<div style="font-size:15px;font-weight:600;color:#182235;line-height:1.4;">{inst_name}</div>'
+        f'<div style="font-size:12.5px;color:#69778A;margin-top:4px;line-height:1.6;">'
+        f'运行时间 {_fmt_ts(ts) or "—"}'
+        f'　·　运行编号 <span style="font-family:Consolas,monospace;">{run_id or "—"}</span>'
+        f'</div></div>'
+        f'<div style="flex:0 0 auto;padding-top:2px;">{status_badge(state, label)}</div>'
+        f'</div>', unsafe_allow_html=True)
+
     obj = result.get("objective_value")
     init = result.get("initial_objective")
     feas = result.get("feasibility_rate")
     rt_ms = result.get("runtime_ms")
     gain = f"{(init - obj) / init * 100:.2f}" if (obj is not None and init) else None
     metric_row([
-        ("最优目标值", f"{obj:,.2f}" if obj is not None else None, "元", ""),
-        ("相对初始改善", gain, "%", "ok" if gain and float(gain) > 0 else ""),
-        ("搜索耗时", f"{rt_ms/1000:.1f}" if rt_ms is not None else None, "s", ""),
-        ("迭代次数", result.get("iterations"), "", ""),
+        ("最优目标值", f"{obj:,.2f}" if obj is not None else None, "元", "", True),
+        ("相对初始改善", gain, "%", "ok" if gain and float(gain) > 0 else "", False),
+        ("搜索耗时", f"{rt_ms/1000:.1f}" if rt_ms is not None else None, "s", "", False),
+        ("迭代次数", result.get("iterations"), "", "", False),
         ("可行性", f"{feas*100:.0f}" if feas is not None else None, "%",
-         "ok" if feas and feas >= 1.0 else "warn"),
+         "ok" if feas and feas >= 1.0 else "warn", False),
     ])
 
-    # 结果完整性 / 异常提示
+    # 紧凑辅助信息
+    msgs = []
+    if result.get("timed_out"):
+        msgs.append("在时间预算附近停止，已保留当前最优解；"
+                    "AI 接口等待与结果保存不计入搜索预算。")
+    if result.get("invalid_candidates"):
+        msgs.append(f"本次拦截 {result['invalid_candidates']} 个不可行候选方案，"
+                    "最终结果只保留通过检查的路线。")
     if inst:
         from solver.model import validate_routes
         v = validate_routes(result.get("paths"), result.get("unassigned"), inst)
         if not v["passed"]:
+            st.write("")
             st.error("当前保存结果未通过路线完整性检查：" + "；".join(v["errors"]) +
                      "。请在求解页重新运行后再分析。")
-    if result.get("timed_out"):
-        st.caption("本次搜索在时间预算附近停止，保留当前最优解；AI 接口等待与结果保存不计入搜索预算。")
+    if msgs:
+        st.write("")
+        notice("　".join(msgs), "warn")
 
     st.write("")
     tab_path, tab_conv, tab_gen, tab_export = st.tabs(["路径", "搜索过程", "生成记录", "导出"])
 
-    # ---- 路径 ----
     with tab_path:
-        paths = result.get("paths") or []
         view = st.radio("视图", ["2D 路径", "3D 空域"], horizontal=True,
                         label_visibility="collapsed", key="path_view")
         c_main, c_side = st.columns([3, 1], gap="large")
         with c_main:
+            section_title("路径视图")
             if not inst:
                 empty_state("缺少实例数据", "无法加载该运行的实例文件，路径视图不可用。")
             elif view == "2D 路径":
@@ -145,29 +141,31 @@ def render():
                                 config={"displaylogo": False, "scrollZoom": True})
         with c_side:
             section_title("路径摘要")
-            total_customers = sum(len([x for x in p if x != 0]) for p in paths if isinstance(p, list))
+            paths = result.get("paths") or []
+            total = sum(len([x for x in p if x != 0]) for p in paths if isinstance(p, list))
             kv_list([
                 ("路径数", len(paths)),
-                ("客户总数", total_customers),
+                ("客户总数", total),
                 ("未服务客户", len(result.get("unassigned") or [])),
                 ("可行性", "可行" if (feas or 0) >= 1.0 else "存在缺口"),
             ])
             st.write("")
             path_legend(paths)
             if view == "3D 空域":
-                st.caption("可拖拽旋转、滚轮缩放；双击图内可重置视角。")
+                st.caption("可拖拽旋转、滚轮缩放；双击图内重置视角。")
 
-    # ---- 搜索过程 ----
     with tab_conv:
+        section_title("收敛过程")
         history = result.get("history") or []
         values = [h["objective"] for h in history if h.get("objective") is not None]
         flat = bool(values) and len(set(values)) == 1
-        st.plotly_chart(charts.convergence(history, flat_note=flat), use_container_width=True,
+        st.plotly_chart(charts.convergence(history), use_container_width=True,
                         config={"displaylogo": False})
         if flat:
-            st.caption(f"本次完成 {result.get('iterations', 0)} 次迭代，未找到更优解，历史最优曲线保持平直。"
-                       "可点击图例中的“候选方案目标值”查看实际尝试过的方案。")
+            st.caption(f"本次完成 {result.get('iterations', 0)} 次迭代，未找到更优解，"
+                       "历史最优曲线保持平直。可点击图例中的“候选方案目标值”查看尝试过的方案。")
         st.write("")
+        section_title("算子表现")
         st.plotly_chart(charts.operator_bars(result), use_container_width=True,
                         config={"displaylogo": False})
         if result.get("operator_stats"):
@@ -176,8 +174,8 @@ def render():
         else:
             st.caption("当前运行没有算子贡献记录。")
 
-    # ---- 生成记录 ----
     with tab_gen:
+        section_title("生成记录")
         if not ev:
             empty_state("暂无生成记录", "本次运行未写入 LLM 生成证据（可能未启用模型服务）。")
         else:
@@ -208,14 +206,13 @@ def render():
                     if code:
                         st.code(code, language="python")
 
-    # ---- 导出 ----
     with tab_export:
         _render_export(result, ev, run_id)
 
 
 def _render_export(result, ev, run_id):
     section_title("当前运行导出")
-    c1, c2, _ = st.columns([1, 1, 2])
+    c1, c2, _ = st.columns([1.1, 1.1, 2])
     with c1:
         st.download_button(
             "导出当前结果 JSON",
@@ -228,14 +225,11 @@ def _render_export(result, ev, run_id):
             f"导出当前证据（{len(ev)} 条）",
             data=json.dumps(ev, ensure_ascii=False, indent=2, default=str),
             file_name=f"evidence_{run_id or 'current'}.json", mime="application/json",
-            use_container_width=True,
-            disabled=(len(ev) == 0),
+            use_container_width=True, disabled=(len(ev) == 0),
         )
 
     st.write("")
-    st.divider()
     section_title("全部运行记录", "按运行时间倒序；可搜索实例名称或运行编号。")
-
     all_recs = _all_evidence()
     rows = _run_rows()
     if not rows:
@@ -262,10 +256,10 @@ def _render_export(result, ev, run_id):
         disabled=(len(all_recs) == 0),
     )
     with st.expander("开发详情", expanded=False):
-        st.caption("内部编号说明：本页对应原 T-15（可视化与证据导出）与 D5（平台证据记录）。"
+        st.caption("本页对应原 T-15（可视化与证据导出）与 D5（平台证据记录）。"
                    "证据文件写入 evidence/rounds/<run_id>/iter_*.json。")
-        st.write(f"- 证据根目录：`evidence/`")
-        st.write(f"- 结果目录：`experiments/results/`")
+        st.write("- 证据根目录：`evidence/`")
+        st.write("- 结果目录：`experiments/results/`")
 
 
 def _all_evidence():

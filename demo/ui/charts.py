@@ -12,8 +12,9 @@ from __future__ import annotations
 from ui.styles import PATH_COLORS, TEXT, TEXT_MUTED, BORDER, PRIMARY
 
 _FONT = "Segoe UI, Microsoft YaHei, PingFang SC, Roboto, Arial, sans-serif"
-_NODE_GREY = "#9AA4B2"
-_WAREHOUSE = "#20242C"
+_NODE_GREY = "#AFB9C9"
+_WAREHOUSE = "#182235"
+_GRID = "#EDF1F8"
 
 
 def _base_layout(fig, title: str, height: int = 460, showlegend: bool = True):
@@ -36,8 +37,8 @@ def _base_layout(fig, title: str, height: int = 460, showlegend: bool = True):
 
 
 def _axes(fig):
-    axis = dict(gridcolor="#EDF0F4", zerolinecolor="#E3E7ED", linecolor=BORDER,
-                tickfont=dict(size=11, color=TEXT_MUTED), showline=True)
+    axis = dict(gridcolor=_GRID, zerolinecolor="#E1E7F0", linecolor=BORDER,
+                tickfont=dict(size=10.5, color=TEXT_MUTED), showline=True)
     fig.update_xaxes(**axis)
     fig.update_yaxes(**axis)
     return fig
@@ -61,11 +62,11 @@ def path_map_2d(result: dict, inst: dict | None, height: int = 460):
         xs_all.append(float(n.get("x", 0.0) or 0.0))
         ys_all.append(float(n.get("y", 0.0) or 0.0))
 
-    # 全部客户节点（中性灰，不按编号上色）
+    # 全部客户节点（中性灰，降低常态视觉重量；密集时 hover 仍可查详情）
     if xs_all:
         fig.add_trace(go.Scatter(
             x=xs_all, y=ys_all, mode="markers", name="客户节点",
-            marker=dict(size=5, color=_NODE_GREY, opacity=0.65,
+            marker=dict(size=3.5, color=_NODE_GREY, opacity=0.45,
                         line=dict(width=0)),
             hovertemplate="客户节点<br>经度 %{x:.6f}<br>纬度 %{y:.6f}<extra></extra>",
         ))
@@ -93,8 +94,8 @@ def path_map_2d(result: dict, inst: dict | None, height: int = 460):
             continue
         fig.add_trace(go.Scatter(
             x=pxs, y=pys, mode="lines+markers", name=f"路径 {i + 1}",
-            line=dict(color=color, width=2),
-            marker=dict(size=7, color=color, line=dict(width=1, color="#FFFFFF")),
+            line=dict(color=color, width=1.8),
+            marker=dict(size=5.5, color=color, line=dict(width=1, color="#FFFFFF")),
             text=ptext, hovertemplate="%{text}<extra>路径 " + str(i + 1) + "</extra>",
         ))
 
@@ -139,9 +140,8 @@ def path_map_3d(result: dict, inst: dict | None, height: int = 560):
             y=[float(n.get("y", 0.0) or 0.0) for n in pts],
             z=[float(n.get("alt", 0.0) or 0.0) for n in pts],
             mode="markers", name="客户节点",
-            marker=dict(size=2.5, color=_NODE_GREY, opacity=0.5),
-            hovertemplate="客户节点<br>经度 %{x:.6f}<br>纬度 %{y:.6f}"
-                          "<br>海拔 %{z:.1f} m<extra></extra>",
+            marker=dict(size=1.8, color=_NODE_GREY, opacity=0.38),
+            hoverinfo="skip", showlegend=False,
         ))
 
     for i, path in enumerate(result.get("paths") or []):
@@ -160,15 +160,15 @@ def path_map_3d(result: dict, inst: dict | None, height: int = 560):
             continue
         fig.add_trace(go.Scatter3d(
             x=xs, y=ys, z=zs, mode="lines+markers", name=f"路径 {i + 1}",
-            line=dict(color=color, width=4),
-            marker=dict(size=3.5, color=color),
+            line=dict(color=color, width=3),
+            marker=dict(size=3, color=color),
             hovertemplate="路径 " + str(i + 1) + "<br>经度 %{x:.6f}<br>纬度 %{y:.6f}"
                           "<br>海拔 %{z:.1f} m<extra></extra>",
         ))
 
     _base_layout(fig, "3D 空域视图 · 海拔与航线", height)
     axis3d = dict(
-        gridcolor="#EDF0F4", zerolinecolor="#E3E7ED", linecolor=BORDER,
+        gridcolor=_GRID, zerolinecolor="#E1E7F0", linecolor=BORDER,
         backgroundcolor="#FFFFFF", showbackground=True,
         tickfont=dict(size=10, color=TEXT_MUTED),
         title_font=dict(size=11, color=TEXT_MUTED),
@@ -202,7 +202,7 @@ def convergence(history: list, height: int = 420, flat_note: bool = False):
             fig.add_trace(go.Scatter(
                 x=[c[0] for c in cand], y=[c[1] for c in cand],
                 mode="markers", name="候选方案目标值",
-                marker=dict(size=4, color="#B6BFCC"),
+                marker=dict(size=4, color="#C2CBD9"),
                 visible="legendonly",
                 hovertemplate="迭代 %{x}<br>候选目标值 %{y:,.4f}<extra></extra>",
             ))
@@ -245,7 +245,7 @@ def operator_bars(result: dict, height: int = 420):
         gains = [stats[n].get("improvement_total", 0.0) for n in names]
         calls = [stats[n].get("calls", 0) for n in names]
         imps = [stats[n].get("improvements", 0) for n in names]
-        colors = ["#315EFB" if g > 0 else "#C7CDD8" for g in gains]
+        colors = [PRIMARY if g > 0 else "#CFD7E4" for g in gains]
         fig.add_trace(go.Bar(
             x=gains, y=y, orientation="h",
             marker=dict(color=colors, line=dict(width=0)),

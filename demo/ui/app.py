@@ -19,28 +19,26 @@ if PROJECT_ROOT not in sys.path:
 
 import streamlit as st
 
-from ui.styles import inject
+from ui.styles import inject, ambient_layer
 from ui.components import sidebar_brand, page_head
 
 PAGES = ["求解", "结果分析", "模型配置"]
 
 st.set_page_config(page_title="SDVRPD 路径优化工作台", page_icon="🛩", layout="wide")
 inject()
+ambient_layer()
 sidebar_brand()
 
 nav = st.sidebar.radio("导航", PAGES, label_visibility="collapsed", key="nav_page")
 
 PAGE_META = {
-    "求解": ("求解", "选择实例与参数，运行 ALNS 求解并查看本次结果。",
-             "SDVRPD · LLM 驱动 ALNS 混合启发式求解器"),
-    "结果分析": ("结果分析", "查看当前运行的路径方案、搜索过程与生成记录，并导出证据。",
-                 "SDVRPD · 结果分析与证据导出"),
-    "模型配置": ("模型配置", "配置大模型服务；未启用时求解器自动使用预置算子。",
-                 "SDVRPD · LLM 算子生成配置"),
+    "求解": ("求解", "选择实例与参数，运行 ALNS 求解并查看本次结果。"),
+    "结果分析": ("结果分析", "查看当前运行的路径方案、搜索过程与生成记录，并导出证据。"),
+    "模型配置": ("模型配置", "配置大模型服务；未启用时求解器自动使用预置算子。"),
 }
 
-title, subtitle, tech = PAGE_META[nav]
-page_head(title, subtitle, tech)
+title, subtitle = PAGE_META[nav]
+page_head(title, subtitle)
 
 if nav == "求解":
     from ui import solve_page
