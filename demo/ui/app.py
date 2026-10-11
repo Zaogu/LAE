@@ -1,14 +1,16 @@
-"""ui/app.py — Streamlit console for SDVRPD LLM ALNS.
+"""ui/app.py —— SDVRPD 路径优化工作台（Streamlit 控制台入口）。
 
-Start:
-    cd demo
-    streamlit run ui/app.py
+结构：
+  侧边栏：产品名 + 导航（求解 / 结果分析 / 模型配置）
+  主内容：页头 + 页面主体
+
+设计：浅色工程工作台（雾白背景 / 白色表面 / 石墨文字 / 低饱和蓝主操作）。
+本文件只负责布局与导航；求解语义（预算、随机种子、模型调用、结果与导出）
+保持在 solve_page / results_page / config_page 中，与原实现一致。
 """
 from __future__ import annotations
-import json
 import os
 import sys
-import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(BASE, ".."))
@@ -17,119 +19,35 @@ if PROJECT_ROOT not in sys.path:
 
 import streamlit as st
 
-st.set_page_config(page_title="SDVRPD LLM ALNS console", page_icon="🚁")
-st.title("SDVRPD LLM 驱动 ALNS 求解器控制台")
+from ui.styles import inject
+from ui.components import sidebar_brand, page_head
 
-tab = st.sidebar.radio("模块", ["配置", "求解", "可视化"])
+PAGES = ["求解", "结果分析", "模型配置"]
 
+st.set_page_config(page_title="SDVRPD 路径优化工作台", page_icon="🛩", layout="wide")
+inject()
+sidebar_brand()
 
-def _json_safe(obj, depth: int = 0):
-    if depth > 12:
-        return "<truncated>"
-    if isinstance(obj, dict):
-        return {str(k): _json_safe(v, depth + 1) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v, depth + 1) for v in list(obj)[:2000]]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
-        return obj
-    return str(obj)
+nav = st.sidebar.radio("导航", PAGES, label_visibility="collapsed", key="nav_page")
 
+PAGE_META = {
+    "求解": ("求解", "选择实例与参数，运行 ALNS 求解并查看本次结果。",
+             "SDVRPD · LLM 驱动 ALNS 混合启发式求解器"),
+    "结果分析": ("结果分析", "查看当前运行的路径方案、搜索过程与生成记录，并导出证据。",
+                 "SDVRPD · 结果分析与证据导出"),
+    "模型配置": ("模型配置", "配置大模型服务；未启用时求解器自动使用预置算子。",
+                 "SDVRPD · LLM 算子生成配置"),
+}
 
-if tab == "配置":
-    from ui.config_tab import render_config_tab
-    render_config_tab()
+title, subtitle, tech = PAGE_META[nav]
+page_head(title, subtitle, tech)
 
-elif tab == "求解":
-    st.subheader("单次求解")
-    import glob
-    inst_dir = os.path.join(PROJECT_ROOT, "data", "instances")
-    insts = sorted(os.path.basename(p) for p in glob.glob(os.path.join(inst_dir, "*.json")))
-    if not insts:
-        st.warning("未找到实例 JSON。请先运行：python data/instance.py --force")
-    else:
-        sel = st.selectbox("选择实例", insts)
-        tb = st.number_input("时间预算 (s)", min_value=5, max_value=300, value=30, step=5,
-                             help="ALNS 路线搜索预算。程序会在接近限时时停止新一轮搜索；AI 接口等待和结果保存属于额外耗时。")
-        seed = st.number_input("随机种子", min_value=0, max_value=99999, value=1, step=1)
-        if st.button("运行求解"):
-            with st.spinner("ALNS 求解中..."):
-                from solver.alns import ALNSSolver
-                from solver.model import load_params
-                from llm.closed_loop import run_llm_loop
-                fp = os.path.join(inst_dir, sel)
-                with open(fp, encoding="utf-8") as f:
-                    inst = json.load(f)
-                params = load_params()
-                llm_res = run_llm_loop(inst, current_objective=0.0, current_unassigned=[], round_no=1)
-                solver = ALNSSolver(
-                    inst,
-                    params=params,
-                    seed=int(seed),
-                    time_budget=float(tb),
-                    destroy_fn=llm_res["destroy_fn"] if llm_res.get("recovery_action") == "llm_ok" else None,
-                    use_checkpoint=True,
-                )
-                out = solver.run()
-                # 将本次 UI 求解结果持久化。此前结果只显示在当前页面，切换到
-                # “可视化”后页面只能读旧实验文件，导致空图或不同实例显示相同。
-                run_id = time.strftime("ui_%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
-                out.update({
-                    "run_id": run_id,
-                    "instance_id": inst.get("instance_id", os.path.splitext(sel)[0]),
-                    "instance_name": sel,
-                    "time_budget": float(tb),
-                    "seed": int(seed),
-                    "recovery_action": llm_res.get("recovery_action"),
-                    "llm_prompt_hash": llm_res.get("llm_prompt_hash", ""),
-                    "llm_attempts": llm_res.get("attempts_log", []),
-                    "llm_static_check": llm_res.get("static_check", {}),
-                })
-                results_dir = os.path.join(PROJECT_ROOT, "experiments", "results")
-                os.makedirs(results_dir, exist_ok=True)
-                result_path = os.path.join(results_dir, f"{run_id}_{out['instance_id']}_s{int(seed)}.json")
-                with open(result_path, "w", encoding="utf-8") as f:
-                    json.dump(out, f, ensure_ascii=False, indent=2)
-                # 固定指针让 dashboard 在 Streamlit 重跑后仍读取刚才这一次。
-                with open(os.path.join(results_dir, "ui_last_result.json"), "w", encoding="utf-8") as f:
-                    json.dump(out, f, ensure_ascii=False, indent=2)
-                # 保存一条可追溯的 LLM/求解证据，时间线不再依赖手工生成文件。
-                from verify.evidence import new_record, append_round
-                evidence = new_record(
-                    iteration_id=1,
-                    stage="ui_run",
-                    llm_prompt_hash=llm_res.get("llm_prompt_hash", ""),
-                    generated_code=llm_res.get("generated_code", ""),
-                    static_check=llm_res.get("static_check", {}),
-                    execution={
-                        "status": "completed",
-                        "objective_value": out.get("objective_value"),
-                        "feasibility_rate": out.get("feasibility_rate"),
-                        "runtime_ms": out.get("runtime_ms"),
-                    },
-                    recovery_action=llm_res.get("recovery_action"),
-                )
-                evidence["run_id"] = run_id
-                evidence["instance_id"] = out["instance_id"]
-                evidence["attempts_log"] = llm_res.get("attempts_log", [])
-                append_round(run_id, evidence)
-                st.json(_json_safe({
-                    "objective_value": out.get("objective_value"),
-                    "feasibility_rate": out.get("feasibility_rate"),
-                    "iterations": out.get("iterations"),
-                    "runtime_ms": out.get("runtime_ms"),
-                    "startup_ms": out.get("startup_ms"),
-                    "timed_out": out.get("timed_out"),
-                    "timeout_reason": out.get("timeout_reason"),
-                    "budget_overrun_ms": out.get("budget_overrun_ms"),
-                    "unassigned": out.get("unassigned"),
-                    "recovery_action": llm_res.get("recovery_action"),
-                    "run_id": run_id,
-                }))
-                if out.get("timed_out"):
-                    st.info(f"已到达时间预算，保留当前最优解（实际搜索 {out.get('runtime_ms')} ms）。")
-                else:
-                    st.success(f"求解完成 | recovery: {llm_res.get('recovery_action')}")
-
-elif tab == "可视化":
-    from ui.dashboard import render_dashboard
-    render_dashboard()
+if nav == "求解":
+    from ui import solve_page
+    solve_page.render()
+elif nav == "结果分析":
+    from ui import results_page
+    results_page.render()
+else:
+    from ui import config_page
+    config_page.render()

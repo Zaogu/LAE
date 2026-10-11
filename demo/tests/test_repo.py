@@ -110,16 +110,23 @@ def test_tc_5_5_1_stats_command(tmp_evidence):
 @pytest.mark.system
 @pytest.mark.p2
 def test_tc_5_6_1_four_views():
-    """AC-5.6：§5.7 四种视图（路径地图/收敛曲线/LLM时间线/3D空域）。"""
+    # AC-5.6：§5.7 四种视图（路径地图 / 收敛曲线 / LLM 时间线 / 3D 空域）。
+    # 各视图在新 UI（2026-10-11）对应的实现标识：
+    #   路径地图 -> charts.path_map_2d / path_map_3d
+    #   收敛曲线 -> charts.convergence
+    #   LLM 时间线 -> results_page 生成记录标签页（timeline 表格）
+    #   3D 空域 -> charts.path_map_3d（海拔航线）
     ui = ROOT / "ui"
     if not ui.exists():
         pytest.skip("可视化模块未实现")
     all_txt = " ".join(
         f.read_text(encoding="utf-8", errors="ignore")
         for f in ui.rglob("*") if f.is_file() and f.suffix in (".py", ".html")
-    )
-    for view in ("path", "convergence", "timeline", "airspace"):
-        assert view in all_txt.lower(), f"缺视图 {view}"
+    ).lower()
+    for view in ("path_map", "convergence", "path_map_3d"):
+        assert view in all_txt, f"缺视图 {view}"
+    # LLM 时间线：生成记录标签页应渲染证据时间线表格
+    assert ("时间线" in all_txt or "timeline" in all_txt or "生成记录" in all_txt), "缺 LLM 时间线视图"
 
 
 @pytest.mark.system
