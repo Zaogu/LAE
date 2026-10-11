@@ -56,6 +56,101 @@ def _signature_ok(tree: ast.AST) -> tuple[bool, str]:
     return False, f"未找到 def destroy(...) 函数；期望签名: def destroy({EXPECTED_SIG})"
 
 
+def _returns_pair(node: ast.AST) -> bool:
+    """判断单个 return 语句是否返回二元结构（tuple/list）。"""
+    if not isinstance(node, ast.Return) or node.value is None:
+        return False
+    v = node.value
+    if isinstance(v, ast.Tuple):
+        return len(v.elts) >= 2
+    if isinstance(v, ast.List):
+        return len(v.elts) >= 2
+    return False
+
+
+def _always_returns(stmts: list) -> bool:
+    """判断语句序列是否在所有路径上都以 return 结束。
+
+    覆盖常见结构：末尾 return；末尾 if/else 两分支都 return；
+    末尾 try/except 均 return。这是保守判定：不确定时返回 False，
+    宁可让可疑代码被重试，也不放行会隐式返回 None 的函数。
+    """
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if isinstance(last, ast.Return):
+        return last.value is not None
+    if isinstance(last, ast.If):
+        body_ok = _always_returns(last.body)
+        else_ok = _always_returns(last.orelse)
+        return body_ok and else_ok
+    if isinstance(last, ast.Try):
+        ok = bool(last.finalbody) and _always_returns(last.finalbody)
+        if not ok:
+            ok = (_always_returns(last.body)
+                  and all(_always_returns(h.body) for h in last.handlers))
+        return ok
+    if isinstance(last, ast.With):
+        return _always_returns(last.body)
+    return False
+
+
+def _direct_returns(fn: ast.FunctionDef) -> list:
+    """收集只属于 fn 自身（不进入嵌套 def/lambda）的 return 节点。
+
+    LLM 常在 destroy 内定义辅助函数（如 node_demand），它们的 return
+    不受 (removed, partial) 接口约束，必须排除，否则误报。
+    """
+    out = []
+
+    def walk_stmts(stmts):
+        for s in stmts:
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue                      # 不下钻嵌套函数定义
+            if isinstance(s, ast.Return):
+                out.append(s)
+                continue
+            for field, value in ast.iter_fields(s):
+                if isinstance(value, list):
+                    walk_stmts([x for x in value if isinstance(x, ast.stmt)])
+                elif isinstance(value, ast.stmt):
+                    walk_stmts([value])
+
+    walk_stmts(fn.body)
+    return out
+
+
+def _return_structure_ok(tree: ast.AST) -> tuple[bool, str]:
+    """检查 destroy 函数体是否在所有路径上都 return 二元结构。
+
+    背景：LLM 生成的算子曾出现“构建完 new_paths 后忘记 return”的漏
+    洞——函数隐式返回 None，注入 ALNS 后抛
+    TypeError: cannot unpack non-iterable NoneType object。
+    原静态检查只验证签名与禁止模式，不检查返回结构（FR-6 第 4 条
+    “返回结构提示”未落实），此函数补齐该缺口。
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "destroy":
+            # 只统计直接属于 destroy 的 return；嵌套辅助函数（如 node_demand）
+            # 的 return 可返回任意值，不受接口约定约束。
+            rets = _direct_returns(node)
+            for r in rets:
+                if r.value is not None and not _returns_pair(r):
+                    # 允许 return [], solution 这类二元返回；其它形态提示风险
+                    if not isinstance(r.value, (ast.Tuple, ast.List)):
+                        continue
+            if not _always_returns(node.body):
+                return False, ("destroy 函数体并非在所有路径上都 return "
+                               "(removed, partial)；存在隐式返回 None 的分支，"
+                               "会导致 TypeError: cannot unpack non-iterable NoneType object")
+            bad = [r for r in rets if r.value is not None and not _returns_pair(r)]
+            if bad:
+                return False, ("destroy 的 return 必须返回二元结构 (removed, partial)；"
+                               f"第 {bad[0].lineno} 行的返回不是二元组")
+            return True, "返回结构完整（所有路径返回二元组）"
+    return False, f"未找到 def destroy(...) 函数；期望签名: def destroy({EXPECTED_SIG})"
+
+
 def _forbidden(tree: ast.AST, source: str) -> list:
     """扫描禁止模式：import 白名单外的模块、危险调用、危险子串。"""
     found = []
@@ -108,7 +203,13 @@ def check_operator(code: str) -> dict:
     if not ok:
         return _fail(result, "signature", msg, "def destroy")
 
-    # 3) 禁止模式
+    # 3) 返回结构（FR-6 第 4 条）：所有路径必须返回 (removed, partial)
+    rok, rmsg = _return_structure_ok(tree)
+    result["return_ok"] = rok
+    if not rok:
+        return _fail(result, "return_structure", rmsg, "def destroy")
+
+    # 4) 禁止模式
     forb = _forbidden(tree, code)
     if forb:
         result["forbidden_patterns"] = forb

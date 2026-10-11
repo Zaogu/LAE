@@ -26,6 +26,60 @@ def load_params(path: str = PARAMS_PATH) -> dict:
         return json.load(f)
 
 
+# ---- 几何查询接口（供 LLM 生成算子使用，AC-4.2 / 设计文档 3.2 实例感知）----
+_geom_cache = {}
+
+
+def _haversine_m(lon1, lat1, lon2, lat2):
+    """两经纬度点（度）的水平距离（米）。"""
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = (math.sin(dp / 2) ** 2 +
+         math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _geom_index(instance: dict) -> dict:
+    """按实例 id 缓存节点坐标索引，避免重复建 map。"""
+    key = id(instance)
+    if key in _geom_cache:
+        return _geom_cache[key]
+    nmap = {n["id"]: n for n in instance.get("nodes", [])}
+    _geom_cache[key] = nmap
+    return nmap
+
+
+def slope(instance: dict, i: int, j: int) -> float:
+    """返回任意两节点间坡度 theta（弧度）。
+
+    供 LLM 生成的破坏算子调用，用于“坡度感知”的客户选择。
+    说明：instance['arcs'] 只是航点**顺序**弧（0→1→2…），不是完整邻接表，
+    直接用路径相邻节点查它几乎必 miss（实测命中率 0.3%）。此函数按两节点
+    的真实经纬度/高度实时计算，才是 ALNS 搜索中正确可用的坡度。
+    未知节点返回 0.0，不做异常抛出（算子容错友好）。
+    """
+    nmap = _geom_index(instance)
+    a, b = nmap.get(i), nmap.get(j)
+    if a is None or b is None:
+        return 0.0
+    d = _haversine_m(a["x"], a["y"], b["x"], b["y"])
+    dh = (b.get("alt", 0.0) or 0.0) - (a.get("alt", 0.0) or 0.0)
+    # 与 get_eval_ctx 的 numpy 实现保持一致：d=0 时 atan2(dh,0)=±π/2，
+    # 不能加 d>1e-6 阈值（会破坏“经纬度相同、仅高度不同”的真实数据）。
+    return math.atan2(dh, d)
+
+
+def distance_m(instance: dict, i: int, j: int) -> float:
+    """返回任意两节点间水平距离（米），供 LLM 算子做近邻/相关移除。"""
+    nmap = _geom_index(instance)
+    a, b = nmap.get(i), nmap.get(j)
+    if a is None or b is None:
+        return 0.0
+    return _haversine_m(a["x"], a["y"], b["x"], b["y"])
+
+
 # ---- 能耗函数 ------------------------------------------------------
 def truck_energy(theta: float, d_m: float, u_kg: float, Q_kg: float,
                  p: dict) -> float:

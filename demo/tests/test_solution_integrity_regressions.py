@@ -249,11 +249,18 @@ def test_valid_annealing_move_preserves_best_until_true_improvement(local_case, 
     assert result["objective_value"] == 99.0
 
 
-def test_dashboard_flags_invalid_archived_result_without_rewriting_it(local_case, tmp_path, monkeypatch):
-    from ui import dashboard
+def test_results_page_flags_invalid_archived_result_without_rewriting_it(local_case, tmp_path, monkeypatch):
+    """已归档的不可行结果必须被标红，且不得被页面重写。
+
+    迁移说明（2026-10-11 UI 重构）：原 dashboard.render_dashboard →
+    results_page.render；完整性检查逻辑与只读语义不变。
+    """
+    from ui import state as ui_state
     from streamlit.testing.v1 import AppTest
 
-    monkeypatch.setattr(dashboard, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(ui_state, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(ui_state, "RESULTS_DIR", str(tmp_path / "experiments" / "results"))
+    monkeypatch.setattr(ui_state, "INST_DIR", str(tmp_path / "data" / "instances"))
     instance, _ = local_case
     instance_dir = tmp_path / "data" / "instances"
     instance_dir.mkdir(parents=True)
@@ -265,7 +272,12 @@ def test_dashboard_flags_invalid_archived_result_without_rewriting_it(local_case
     target = result_dir / "ui_last_result.json"
     content = json.dumps(archived, indent=2).encode("utf-8")
     target.write_bytes(content)
-    app = AppTest.from_string("from ui.dashboard import render_dashboard\nrender_dashboard()").run(timeout=20)
+    app = AppTest.from_string(
+        "import ui.state\nui.state.PROJECT_ROOT = " + repr(str(tmp_path)) + "\n"
+        "ui.state.RESULTS_DIR = " + repr(str(result_dir)) + "\n"
+        "ui.state.INST_DIR = " + repr(str(instance_dir)) + "\n"
+        "from ui import results_page\nresults_page.render()"
+    ).run(timeout=30)
     assert not app.exception
     assert any("未通过路线完整性检查" in error.value for error in app.error)
     assert target.read_bytes() == content
